@@ -52,3 +52,7 @@ typedef struct {
 void input_inject_pen(int16_t x, int16_t y, bool pen_up);
 void input_inject_key(uint16_t ascii, uint16_t keycode, uint16_t modifiers);
 bool input_pop_key(input_key_event_t *out);
+
+/* Latest battery voltage in millivolts (sampled from the CW2017 I2C fuel gauge
+ * on Xteink X4 Pro, or 0 if not present). */
+int input_get_battery_mv(void);

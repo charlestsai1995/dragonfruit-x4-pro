@@ -23,9 +23,18 @@
 
 static const char *TAG = "m68kjit";
 
-#define JIT_CACHE_BYTES (104 * 1024)    /* design size; shrinks if EXEC heap is tighter */
+#if CONFIG_IDF_TARGET_ESP32S3
+/* On ESP32-S3, SRAM1 is a unified D/IRAM pool shared by MALLOC_CAP_EXEC and
+ * internal 8-bit/DMA DRAM. Keep a healthy reserve for DMA (SDMMC, SPI) and
+ * FreeRTOS task stacks. */
+#define JIT_CACHE_BYTES   (96 * 1024)
+#define JIT_EXEC_RESERVE  (64 * 1024)
+#else
+#define JIT_CACHE_BYTES   (104 * 1024)    /* design size; shrinks if EXEC heap is tighter */
+#define JIT_EXEC_RESERVE  4096
+#endif
 
-static bool g_diram;            /* true => write via the inverted data alias */
+static bool g_diram;            /* true => write via the D/IRAM data alias */
 
 jit_exec_region_t jit_exec_alloc(size_t min_bytes)
 {
@@ -34,11 +43,14 @@ jit_exec_region_t jit_exec_alloc(size_t min_bytes)
     /* Floor the allocation so every segment can hold one worst-case block; below
      * this the JIT would "succeed" but silently drop every block too big for a
      * segment. Better to fail here and fall back cleanly to the interpreter. */
+    size_t free_exec = heap_caps_get_free_size(MALLOC_CAP_EXEC);
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_EXEC);
     ESP_LOGI(TAG, "EXEC heap: total free=%u, largest block=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_EXEC), (unsigned)largest);
+             (unsigned)free_exec, (unsigned)largest);
+    size_t max_safe = (free_exec > JIT_EXEC_RESERVE) ? (free_exec - JIT_EXEC_RESERVE) : 0;
+    if (largest < max_safe) max_safe = largest;
     size_t want = JIT_CACHE_BYTES;
-    if (want > largest) want = (largest > min_bytes) ? (largest - 4096) : 0;
+    if (want > max_safe) want = (max_safe >= min_bytes) ? (max_safe & ~4095u) : 0;
 
     uint8_t *code = NULL;
     while (want >= min_bytes) {

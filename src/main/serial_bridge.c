@@ -5,15 +5,21 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+#include "driver/usb_serial_jtag.h"
+#else
 #include "driver/uart.h"
+#endif
 #include "esp_log.h"
 
 #include "dragonball.h"
 
 static const char *TAG = "serbridge";
 
+#if !CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
 #define BRIDGE_UART   CONFIG_ESP_CONSOLE_UART_NUM        /* UART0 == the CP2104/USB-C line */
 #define CONSOLE_BAUD  CONFIG_ESP_CONSOLE_UART_BAUDRATE   /* restore this when bridging ends */
+#endif
 
 /* Bridge state. s_mode/s_baud are set once at init. s_desired is the policy input
  * (set by the cpu task's auto-trigger or the `serial` command); s_active is the
@@ -46,6 +52,13 @@ static int sink_vprintf(const char *fmt, va_list ap)
  * contends for the read mutex. */
 static void bridge_enter(void)
 {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    ESP_LOGI(TAG, "passthrough ON (USB Serial/JTAG @ %d baud)", s_baud);
+    db_uart_set_loopback(false);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    s_prev_vprintf = esp_log_set_vprintf(sink_vprintf);
+    s_active = true;
+#else
     ESP_LOGI(TAG, "passthrough ON (UART%d @ %d baud)", BRIDGE_UART, s_baud);
     db_uart_set_loopback(false);             /* loopback would add a 2nd RX-ring producer (echo) */
     uart_wait_tx_done(BRIDGE_UART, pdMS_TO_TICKS(100));  /* flush pending console output */
@@ -53,10 +66,17 @@ static void bridge_enter(void)
     uart_set_baudrate(BRIDGE_UART, s_baud);
     uart_flush_input(BRIDGE_UART);           /* drop stale console-typed bytes */
     s_active = true;                         /* console now forwards RX to the emulated UART */
+#endif
 }
 
 static void bridge_exit(void)
 {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    s_active = false;
+    vTaskDelay(pdMS_TO_TICKS(20));
+    if (s_prev_vprintf) { esp_log_set_vprintf(s_prev_vprintf); s_prev_vprintf = NULL; }
+    ESP_LOGI(TAG, "passthrough OFF — console restored (USB Serial/JTAG)");
+#else
     s_active = false;                        /* console returns to command mode */
     uart_wait_tx_done(BRIDGE_UART, pdMS_TO_TICKS(100));
     uart_set_baudrate(BRIDGE_UART, CONSOLE_BAUD);
@@ -64,6 +84,7 @@ static void bridge_exit(void)
     uart_flush_input(BRIDGE_UART);
     ESP_LOGI(TAG, "passthrough OFF — console restored (UART%d @ %d baud)",
              BRIDGE_UART, CONSOLE_BAUD);
+#endif
 }
 
 /* One pump pass while active: TX only. The console task handles RX (wire ->
@@ -82,7 +103,11 @@ static void bridge_pump(void)
         return;
     }
     for (uint32_t off = 0; off < txn && s_desired; ) {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+        int w = usb_serial_jtag_write_bytes((const char *)buf + off, txn - off, pdMS_TO_TICKS(10));
+#else
         int w = uart_tx_chars(BRIDGE_UART, (const char *)buf + off, txn - off);
+#endif
         if (w > 0) off += (uint32_t)w;
         else       vTaskDelay(1);            /* FIFO full: yield, then re-check s_desired */
     }

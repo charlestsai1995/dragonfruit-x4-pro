@@ -14,6 +14,7 @@ services:
       context: .
       dockerfile: Dockerfile
     image: dragonfruit-idf:release-v6.0
+    network_mode: none
     # Bind-mount the repo so build artifacts land in ./build on the host.
     volumes:
       - .:/project

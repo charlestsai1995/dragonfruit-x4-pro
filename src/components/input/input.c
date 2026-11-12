@@ -97,13 +97,30 @@ int input_pop_br_request(void)
 #define GT911_FWVER_REG     0x8144
 #define GT911_RESOL_REG     0x8146
 
+#if CONFIG_IDF_TARGET_ESP32S3
+/* Xteink X4 Pro pins */
+#define PIN_SDA         39
+#define PIN_SCL         38
+#define PIN_INT         10
+#define PIN_TOUCH_PWR   2
+#define PIN_TOUCH_RST   4
+#define PIN_BTN_L       0    /* Up button   -> Page Up / >=1s hold = Backup  */
+#define PIN_BTN_M       3    /* Power btn   -> >=1s hold = Sleep/Wake        */
+#define PIN_BTN_R       7    /* Down button -> Page Down / >=1s hold = Restore */
+#define I2C_BUS_SPEED   100000
+#define CW2017_ADDR     0x63
+#define CW2017_REG_VCELL 0x02
+#define CW2017_REG_MODE  0x08
+#else
 /* M5 Paper pins */
-#define PIN_SDA     21
-#define PIN_SCL     22
-#define PIN_INT     36
-#define PIN_BTN_L   37
-#define PIN_BTN_M   38
-#define PIN_BTN_R   39
+#define PIN_SDA         21
+#define PIN_SCL         22
+#define PIN_INT         36
+#define PIN_BTN_L       37
+#define PIN_BTN_M       38
+#define PIN_BTN_R       39
+#define I2C_BUS_SPEED   400000
+#endif
 
 bool input_button_held(int which)
 {
@@ -120,6 +137,10 @@ static uint8_t gt911_addr = GT911_ADDR;
 static bool gt911_found = false;
 static i2c_master_bus_handle_t gt911_bus;   /* I2C0 master bus */
 static i2c_master_dev_handle_t gt911_dev;   /* GT911 device (7-bit addr bound at probe) */
+#if CONFIG_IDF_TARGET_ESP32S3
+static i2c_master_dev_handle_t cw2017_dev;  /* CW2017 battery fuel gauge (0x63) */
+#endif
+static volatile int s_battery_mv = 4000;
 static bool last_pen_down = false;
 static int16_t last_px = -1, last_py = -1;   /* last streamed stroke point */
 static bool last_btn_l = false;
@@ -133,6 +154,55 @@ static int  tap_row = -1, tap_col = 0;   /* page key held for a tap; row < 0 = i
 static TickType_t tap_pulse_until = 0;
 static uint32_t poll_diag_count = 0;
 
+int input_get_battery_mv(void)
+{
+    return s_battery_mv;
+}
+
+#if CONFIG_IDF_TARGET_ESP32S3
+static void cw2017_poll_battery(void)
+{
+    if (!cw2017_dev) return;
+    uint8_t reg = CW2017_REG_VCELL;
+    uint8_t buf[2] = {0};
+    if (i2c_master_transmit_receive(cw2017_dev, &reg, 1, buf, 2, 50) == ESP_OK) {
+        uint16_t raw14 = (((uint16_t)buf[0] << 8) | buf[1]) & 0x3FFFu;
+        int mv = (int)((raw14 * 5u + 8u) >> 4u);
+        if (mv >= 2500 && mv <= 4500) {
+            s_battery_mv = mv;
+        }
+    }
+}
+
+static void cw2017_init_gauge(void)
+{
+    i2c_device_config_t dc = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = CW2017_ADDR,
+        .scl_speed_hz    = I2C_BUS_SPEED,
+    };
+    if (i2c_master_bus_add_device(gt911_bus, &dc, &cw2017_dev) != ESP_OK) {
+        cw2017_dev = NULL;
+        return;
+    }
+    uint8_t reg = CW2017_REG_MODE;
+    uint8_t mode = 0;
+    if (i2c_master_transmit_receive(cw2017_dev, &reg, 1, &mode, 1, 50) != ESP_OK) {
+        ESP_LOGW(TAG, "CW2017 not responding at 0x%02X", CW2017_ADDR);
+        i2c_master_bus_rm_device(cw2017_dev);
+        cw2017_dev = NULL;
+        return;
+    }
+    if (mode != 0x00) {
+        uint8_t wake_cmd[2] = { CW2017_REG_MODE, 0x00 };
+        i2c_master_transmit(cw2017_dev, wake_cmd, sizeof(wake_cmd), 50);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    cw2017_poll_battery();
+    ESP_LOGI(TAG, "CW2017 fuel gauge ready (%d mV)", s_battery_mv);
+}
+#endif
+
 /* --- GT911 I2C helpers --- */
 
 /* Bind the GT911 device handle to a 7-bit address. The panel answers at 0x14 or
@@ -144,7 +214,7 @@ static esp_err_t gt911_use_addr(uint8_t addr)
     i2c_device_config_t dc = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = addr,
-        .scl_speed_hz    = 400000,
+        .scl_speed_hz    = I2C_BUS_SPEED,
     };
     gt911_addr = addr;
     return i2c_master_bus_add_device(gt911_bus, &dc, &gt911_dev);
@@ -252,6 +322,25 @@ static void gt911_sync_sensitivity(void)
 
 esp_err_t input_init(void)
 {
+#if CONFIG_IDF_TARGET_ESP32S3
+    /* Xteink X4 Pro: Enable active-low touch power rail (GPIO 2) and run
+     * GT911 reset sequence on RST (GPIO 4) + INT (GPIO 10) for 0x5D/0x14. */
+    gpio_hold_dis(PIN_TOUCH_PWR);
+    gpio_set_direction(PIN_TOUCH_PWR, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_TOUCH_PWR, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    gpio_hold_dis(PIN_TOUCH_RST);
+    gpio_hold_dis(PIN_INT);
+    gpio_set_direction(PIN_TOUCH_RST, GPIO_MODE_OUTPUT);
+    gpio_set_direction(PIN_INT, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_INT, 0);
+    gpio_set_level(PIN_TOUCH_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(PIN_TOUCH_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
+#endif
+
     i2c_master_bus_config_t bus_conf = {
         .i2c_port = I2C_NUM_0,
         .sda_io_num = PIN_SDA,
@@ -265,7 +354,7 @@ esp_err_t input_init(void)
     /* M5EPD library waits 100ms after Wire.begin() before first GT911 access */
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    /* GT911 INT pin (input-only GPIO, no internal pull-up on 34-39) */
+    /* GT911 INT pin */
     gpio_config_t int_conf = {
         .pin_bit_mask = (1ULL << PIN_INT),
         .mode = GPIO_MODE_INPUT,
@@ -275,22 +364,30 @@ esp_err_t input_init(void)
     };
     gpio_config(&int_conf);
 
-    /* Hardware buttons (input-only GPIOs 37-39, external pull-ups on M5 Paper) */
+    /* Hardware buttons (active-low) */
     gpio_config_t btn_conf = {
         .pin_bit_mask = (1ULL << PIN_BTN_L) | (1ULL << PIN_BTN_M) | (1ULL << PIN_BTN_R),
         .mode = GPIO_MODE_INPUT,
+#if CONFIG_IDF_TARGET_ESP32S3
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+#else
         .pull_up_en = GPIO_PULLUP_DISABLE,
+#endif
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&btn_conf);
 
+#if CONFIG_IDF_TARGET_ESP32S3
+    cw2017_init_gauge();
+#endif
+
     /* Probe GT911 at primary address, then alternate */
     uint8_t product_id[4];
-    if (gt911_use_addr(GT911_ADDR) == ESP_OK &&
+    if (gt911_use_addr(GT911_ADDR_ALT) == ESP_OK &&
         gt911_read(GT911_PRODUCT_REG, product_id, 4) == ESP_OK) {
         gt911_found = true;
-    } else if (gt911_use_addr(GT911_ADDR_ALT) == ESP_OK &&
+    } else if (gt911_use_addr(GT911_ADDR) == ESP_OK &&
                gt911_read(GT911_PRODUCT_REG, product_id, 4) == ESP_OK) {
         gt911_found = true;
     }
@@ -404,9 +501,13 @@ void input_poll(void)
         esp_err_t err = gt911_read(GT911_STATUS_REG, &status, 1);
 
         /* Periodic diagnostic logging (every ~5 s at the 100 Hz poll rate) */
-        if (poll_diag_count++ % 500 == 0)
+        if (poll_diag_count++ % 500 == 0) {
+#if CONFIG_IDF_TARGET_ESP32S3
+            cw2017_poll_battery();
+#endif
             ESP_LOGI(TAG, "poll: err=%d status=0x%02X int=%d",
                      err, status, gpio_get_level(PIN_INT));
+        }
 
         if (err == ESP_OK && (status & 0x80)) {
             uint8_t num_fingers = status & 0x0F;

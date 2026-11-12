@@ -32,10 +32,19 @@ m68k_cpu_t *cpup;
 #define cpu (*cpup)
 static volatile uint32_t total_cycles = 0;
 
+#if CONFIG_IDF_TARGET_ESP32S3
+/* Xteink X4 Pro: Power button = GPIO3 (active-low), Power latch = GPIO1 (active-high),
+ * Frontlight = GPIO8 (Cool) & GPIO9 (Warm). */
+#define PIN_BTN_POWER     GPIO_NUM_3
+#define PIN_POWER_LATCH   GPIO_NUM_1
+#define PIN_FL_COOL       GPIO_NUM_8
+#define PIN_FL_WARM       GPIO_NUM_9
+#else
 /* M5Paper middle button = GPIO38 (active-low, external pull-up): the power/
  * wake-sleep button and the light-sleep wake source. */
-#define PIN_BTN_POWER  GPIO_NUM_38
-#define POWER_HOLD_MS  1000     /* >=1s hold to wake from light sleep */
+#define PIN_BTN_POWER     GPIO_NUM_38
+#endif
+#define POWER_HOLD_MS     1000     /* >=1s hold to wake from light sleep */
 
 /* MC68EZ328 core clock. The IIIx clocks the DragonBall EZ at 16.58 MHz; the cpu
  * task runs CYCLES_PER_BATCH (~1 ms of emulated time) per iteration and reports
@@ -395,6 +404,11 @@ static void maybe_enter_light_sleep(void)
         vTaskDelay(pdMS_TO_TICKS(20));
 
     esp_sleep_pd_config(ESP_PD_DOMAIN_VDDSDIO, ESP_PD_OPTION_ON);  /* keep PSRAM */
+#if CONFIG_IDF_TARGET_ESP32S3
+    /* Keep the Xteink X4 Pro battery power latch (GPIO 1) driven HIGH during sleep */
+    gpio_set_level(PIN_POWER_LATCH, 1);
+    gpio_hold_en(PIN_POWER_LATCH);
+#endif
     gpio_wakeup_enable(PIN_BTN_POWER, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
 
@@ -413,6 +427,10 @@ static void maybe_enter_light_sleep(void)
         ESP_LOGI(TAG, "SLEEP ESP32 wake bump (<1s) — back to sleep");
     }
     gpio_wakeup_disable(PIN_BTN_POWER);
+#if CONFIG_IDF_TARGET_ESP32S3
+    gpio_hold_dis(PIN_POWER_LATCH);
+    gpio_set_level(PIN_POWER_LATCH, 1);
+#endif
     ESP_LOGI(TAG, "SLEEP ESP32 WAKE PC=%08lX", (unsigned long)cpu.regs.pc);
 
     /* Wait for the wake-hold to be released before waking the emulated device,
@@ -739,10 +757,6 @@ static void input_task(void *param)
 #define BAT_LEVEL_EMPTY  110
 #define BAT_ADC_SAMPLES  8               /* averaged per reading */
 
-static adc_oneshot_unit_handle_t bat_adc;
-static adc_cali_handle_t         bat_cali;
-static bool                      bat_cali_ok;
-
 /* Convert a true pack voltage (mV) to the 12-bit ADS7846 sample (level<<4). */
 static uint16_t battery_mv_to_sample(int mv)
 {
@@ -756,6 +770,11 @@ static uint16_t battery_mv_to_sample(int mv)
     if (sample < 0)      sample = 0;
     return (uint16_t)sample;
 }
+
+#if !CONFIG_IDF_TARGET_ESP32S3
+static adc_oneshot_unit_handle_t bat_adc;
+static adc_cali_handle_t         bat_cali;
+static bool                      bat_cali_ok;
 
 static void battery_init(void)
 {
@@ -795,9 +814,26 @@ static void battery_init(void)
     if (!bat_cali_ok)
         ESP_LOGW(TAG, "battery: ADC calibration unavailable; readings approximate");
 }
+#endif
 
 static void battery_task(void *param)
 {
+#if CONFIG_IDF_TARGET_ESP32S3
+    /* Xteink X4 Pro uses the CW2017 I2C fuel gauge (sampled on the shared I2C
+     * bus in input.c). */
+    for (;;) {
+        if (esp32_powersave_requested) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+        int pack_mv = input_get_battery_mv();
+        uint16_t sample = battery_mv_to_sample(pack_mv);
+        db_spi_set_battery_sample(sample);
+        ESP_LOGI(TAG, "battery (CW2017): %d mV -> sample 0x%03X (level %d)",
+                 pack_mv, sample, sample >> 4);
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+#else
     battery_init();
     if (!bat_adc) vTaskDelete(NULL);   /* no ADC: leave the default sample */
 
@@ -825,6 +861,7 @@ static void battery_task(void *param)
         }
         vTaskDelay(pdMS_TO_TICKS(10000));   /* battery moves slowly */
     }
+#endif
 }
 
 /* How often the display task checks Palm's framebuffer for changes. This is the
@@ -882,6 +919,22 @@ static void display_task(void *param)
 
 void app_main(void)
 {
+#if CONFIG_IDF_TARGET_ESP32S3
+    /* Xteink X4 Pro: Assert battery power latch (GPIO 1 HIGH) immediately and
+     * ensure frontlight LEDs (GPIO 8 Cool, GPIO 9 Warm) are off. */
+    gpio_hold_dis(PIN_POWER_LATCH);
+    gpio_set_direction(PIN_POWER_LATCH, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_POWER_LATCH, 1);
+    gpio_sleep_sel_dis(PIN_POWER_LATCH);
+
+    gpio_hold_dis(PIN_FL_COOL);
+    gpio_set_direction(PIN_FL_COOL, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_FL_COOL, 0);
+    gpio_hold_dis(PIN_FL_WARM);
+    gpio_set_direction(PIN_FL_WARM, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_FL_WARM, 0);
+#endif
+
     /* Reserve the JIT's executable cache first, while the internal D/IRAM (SRAM1)
      * region is still unfragmented — later display/SD/bus allocations otherwise
      * split it, shrinking the cache and emulation speed. Codegen runs only once

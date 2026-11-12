@@ -6,8 +6,13 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
+#else
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
+#endif
 #include "esp_log.h"
 
 #include "m68k.h"
@@ -347,7 +352,11 @@ static void console_task(void *arg)
     char    line[128];
     int     len = 0;
     uint8_t buf[64];
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    ESP_LOGI(TAG, "debug console ready on USB Serial/JTAG — type 'help'");
+#else
     ESP_LOGI(TAG, "debug console ready on UART%d — type 'help'", CONSOLE_UART);
+#endif
     for (;;) {
         bool pass = serial_bridge_active();
 
@@ -361,7 +370,11 @@ static void console_task(void *arg)
             if (freeb < want) want = freeb;
         }
 
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+        int n = usb_serial_jtag_read_bytes(buf, want, pdMS_TO_TICKS(50));
+#else
         int n = uart_read_bytes(CONSOLE_UART, buf, want, pdMS_TO_TICKS(50));
+#endif
         if (n <= 0) continue;
 
         if (pass) {
@@ -380,6 +393,14 @@ static void console_task(void *arg)
 
 void debug_console_start(void)
 {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    usb_serial_jtag_driver_config_t usb_cfg = {
+        .tx_buffer_size = 1024,
+        .rx_buffer_size = 2048,
+    };
+    usb_serial_jtag_driver_install(&usb_cfg);
+    usb_serial_jtag_vfs_use_driver();
+#else
     /* Route stdout through the interrupt-driven UART driver so printf()/REPLY
      * reach the wire; the console reads RX directly via uart_read_bytes (see
      * console_task), so no stdin/line-ending setup is needed. ESP_LOG shares this
@@ -397,6 +418,7 @@ void debug_console_start(void)
     uart_driver_install(CONSOLE_UART, 2048, 0, 0, NULL, 0);
     uart_param_config(CONSOLE_UART, &uart_config);
     uart_vfs_dev_use_driver(CONSOLE_UART);
+#endif
 
     xTaskCreatePinnedToCore(console_task, "console", 4096, NULL, 2, NULL, 0);
 }
