@@ -1,4 +1,6 @@
-# Dragonfruit
+# Dragonfruit (Xteink X4 Pro Fork)
+
+> **Note:** This fork of Dragonfruit is specifically ported and configured for the **Xteink X4 Pro** (ESP32-S3, 4.3" 800×480 e-ink panel). The original upstream project targeted the M5Paper (classic ESP32).
 
 An emulator of the Motorola MC68EZ328 ("DragonBall EZ"), the 68000-based
 system-on-chip at the heart of the late-90s Palm handhelds, with enough of the surrounding
@@ -7,10 +9,10 @@ portable C: a 68000 interpreter plus models of the DragonBall's on-chip peripher
 (interrupt controller, timer, RTC, GPIO, SPI, UART, LCD controller).
 
 The core has no platform dependencies. It runs headless on a PC for development and on ESP32
-hardware for the real thing. The reference target is the **M5Paper**, an ESP32 board with an
-e-ink panel and a capacitive touchscreen, which the emulator turns into a working Palm IIIx:
-it boots to the launcher, runs the first-boot setup wizard, and takes stylus input including
-Graffiti handwriting.
+hardware for the real thing. This fork targets the **Xteink X4 Pro**, an ESP32-S3 e-reader
+with an 800×480 e-ink panel and a capacitive touchscreen, turning it into a working Palm IIIx:
+it boots to the launcher, runs the first-boot setup wizard, and takes stylus/finger input
+including Graffiti handwriting.
 
 You supply the ROM. Palm OS is copyrighted and is not included here; see [Running it](#running-it).
 
@@ -53,13 +55,15 @@ On the ESP32 side the requirements are external PSRAM (the 2 MB of emulated RAM 
 image live there) and two cores (the JIT's compiler runs on the second one). That rules out
 single-core, no-PSRAM parts such as the ESP32-C3.
 
-## Hardware (M5Paper reference target)
+## Hardware (Xteink X4 Pro target)
 
-- **SoC** — ESP32-D0WDQ6-V3, dual-core 240 MHz, 16 MB flash, 8 MB PSRAM.
-- **Display** — IT8951 e-ink controller over SPI, 960×540 panel. The Palm's 160×160 1bpp
-  framebuffer is scaled and rotated 90° counter-clockwise into a top-aligned portrait layout,
-  with the Graffiti silkscreen rendered below it.
-- **Touch** — GT911 capacitive controller over I²C.
+- **SoC** — ESP32-S3, dual-core Xtensa LX7 @ 240 MHz, 16 MB QIO flash, 8 MB Octal PSRAM (80 MHz), native USB Serial/JTAG console.
+- **Display** — 4.3" 800×480 e-ink panel over SPI (`epd_x4pro.c`), with runtime auto-detection across X4 Pro panel controller variants (UC8279, UC8179, and SSD1677). The Palm's 160×160 1bpp framebuffer is scaled and rotated into a portrait layout with the Graffiti silkscreen rendered below it.
+- **Touch** — GT911 capacitive controller over I²C (SDA=GPIO39, SCL=GPIO38, INT=GPIO10, RST=GPIO4, PWR=GPIO2).
+- **Buttons & Power** — Up (`GPIO0`), Power (`GPIO3`), and Down (`GPIO7`) buttons, battery power latch (`GPIO1`), and CW2017 I²C battery fuel gauge (`0x63`).
+- **Storage** — microSD over 1-bit SDMMC (`CLK=GPIO41`, `CMD=GPIO42`, `D0=GPIO40`) with active-low card power switch (`GPIO5`).
+
+*(Original M5Paper classic ESP32 / IT8951 drivers remain in the tree when building for `esp32`.)*
 
 ## Repository layout
 
@@ -72,13 +76,14 @@ src/
     bus/            24-bit address space: 2 MB RAM, the ROM window, peripheral decode
     dragonball/     MC68EZ328 peripherals: interrupt controller, timer, RTC, GPIO,
                     SPI (digitizer + battery ADC), UART, LCD controller
-    display/        IT8951 e-ink driver; composites the framebuffer and silkscreen overlay
-    input/          GT911 touch polling into a pen-event queue; button latches
+    display/        E-ink driver (epd_x4pro.c for X4 Pro / it8951.c for M5Paper); composites
+                    the framebuffer and silkscreen overlay
+    input/          GT911 touch polling into a pen-event queue; button latches; CW2017 gauge
     layout/         Panel-to-Palm coordinate mapping, shared by display and input
     config/         Reads the optional layout config off the SD card at boot
     rom_loader/     Loads the ROM from the SD card into PSRAM at boot
     installer/      Installs PRC/PDB/PQA into RAM; backs up and restores databases
-    m5_sd/          Owns the shared microSD mount on the e-ink SPI bus
+    m5_sd/          microSD mount (1-bit SDMMC on X4 Pro, shared SPI on M5Paper)
   host/             PC build harness: runs the core headless, with esp_shim.h in place of
                     ESP-IDF and a PNG snapshotter (plus an optional SDL window) for the screen
 tools/              Host-side scripts that drive the on-device serial debug console
@@ -118,20 +123,77 @@ cmake --build build-host
 ./build-host/dragonfruit -r Palm-IIIx-3.1.rom --ui
 ```
 
-### On the M5Paper
+### On the Xteink X4 Pro
 
-The firmware builds in a reproducible ESP-IDF Docker container; flashing runs on the host,
-because Docker Desktop on Windows cannot pass through COM ports.
+You can build the firmware either manually with a local ESP-IDF installation or inside the reproducible Docker container.
 
-```powershell
+#### Option 1: Manual compilation (ESP-IDF CLI)
+
+1. Install **ESP-IDF** (v5.x or v6.0 recommended) with ESP32-S3 toolchain support, and activate the environment in your shell:
+
+   ```bash
+   # Adjust path to your ESP-IDF installation
+   . $HOME/esp/esp-idf/export.sh
+   ```
+
+2. Configure the target for `esp32s3` and build:
+
+   ```bash
+   # Only needed on a fresh checkout or after fullclean (recreate sdkconfig from sdkconfig.defaults):
+   idf.py set-target esp32s3
+
+   # Compile the firmware:
+   idf.py build
+   ```
+
+   This produces the build artifacts under `build/`:
+   - `build/bootloader/bootloader.bin` (offset `0x0`)
+   - `build/partition_table/partition-table.bin` (offset `0x8000`)
+   - `build/dragonfruit.bin` (offset `0x10000`)
+
+3. **(Optional) Create a single merged binary** (e.g. for web flashers or full-image backups):
+
+   ```bash
+   esptool.py --chip esp32s3 merge_bin \
+     -o dragonfruit-x4pro-merged.bin \
+     --flash_mode dio --flash_freq 80m --flash_size 16MB \
+     0x0 build/bootloader/bootloader.bin \
+     0x8000 build/partition_table/partition-table.bin \
+     0x10000 build/dragonfruit.bin
+   ```
+
+4. **Flash and monitor** over USB-C (replace `/dev/ttyACM0` with your serial port, e.g. `/dev/ttyUSB0` or `COM5`):
+
+   ```bash
+   # Using idf.py:
+   idf.py -p /dev/ttyACM0 flash monitor
+
+   # Or directly with esptool:
+   python -m esptool --chip esp32s3 --port /dev/ttyACM0 --baud 460800 \
+     write-flash --flash-mode dio --flash-size 16MB --flash-freq 80m \
+     0x0 build/bootloader/bootloader.bin \
+     0x8000 build/partition_table/partition-table.bin \
+     0x10000 build/dragonfruit.bin
+   ```
+
+#### Option 2: Docker container build
+
+If you prefer not to install ESP-IDF locally, you can build inside the containerized toolchain (`espressif/idf:release-v6.0`):
+
+```bash
+# Linux / macOS:
+docker compose run --rm idf idf.py build
+
+# Windows PowerShell helper:
 ./build.ps1                       # idf.py build inside the container (subcommands pass through)
-./flash.ps1 -Port COM5 -Monitor   # esptool from the host; -Monitor opens the serial log at 115200
 ```
 
-The ROM is not embedded in the firmware. Copy a Palm IIIx ROM to a FAT32 SD card as
-`palm.rom` and insert it before powering on. At boot the firmware mounts the card (it shares
-the e-ink SPI bus), reads the ROM into PSRAM, then unmounts. If the card or file is missing or
-invalid, the device prints the reason on the e-ink panel and halts.
+#### Preparing the SD card
+
+The ROM is not embedded in the firmware. Copy a Palm IIIx ROM to a FAT32 microSD card as
+`palm.rom` and insert it before powering on. At boot the firmware powers on the SD slot, mounts
+the card over 1-bit SDMMC, reads the ROM into PSRAM, then unmounts. If the card or file is
+missing or invalid, the device prints the reason on the e-ink panel and halts.
 
 #### What goes on the SD card
 
