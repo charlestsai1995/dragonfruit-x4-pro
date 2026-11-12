@@ -67,17 +67,38 @@ jit_exec_region_t jit_exec_alloc(size_t min_bytes)
     g_diram = esp_ptr_in_diram_iram(code);   /* SRAM1 instruction alias? */
     r.base = code;
     r.size = (int)want;
+#if CONFIG_IDF_TARGET_ESP32S3
+    const char *mode = g_diram ? "D/IRAM linear" : "SRAM0 linear";
+#else
+    const char *mode = g_diram ? "D/IRAM inverted" : "SRAM0 linear";
+#endif
     ESP_LOGI(TAG, "JIT exec cache: %dKB @ %p (%s)",
-             (int)want / 1024, code, g_diram ? "D/IRAM inverted" : "SRAM0 linear");
+             (int)want / 1024, code, mode);
     return r;
 }
 
 void jit_exec_write_word(uint32_t instr_addr, uint32_t w)
 {
+#if CONFIG_IDF_TARGET_ESP32S3
+    /* On real ESP32-S3 silicon, SRAM1 is linearly aliased between DRAM
+     * (0x3FC88000..) and IRAM (0x40378000..). However, QEMU's esp32s3 machine
+     * (including eink-qemu) models esp32s3.dram and esp32s3.iram as separate,
+     * unaliased MemoryRegions: writing only to the DRAM alias leaves the IRAM
+     * region full of zeros (0x000000 = Xtensa ILL). Writing through both the
+     * DRAM alias and the 32-bit IRAM address works on both real hardware and
+     * QEMU (MEMPROT is disabled in sdkconfig.defaults.esp32s3). */
+    if (g_diram) {
+        volatile uint32_t *d =
+            (volatile uint32_t *)esp_ptr_diram_iram_to_dram((void *)(uintptr_t)instr_addr);
+        *d = w;
+    }
+    *(volatile uint32_t *)(uintptr_t)instr_addr = w;
+#else
     volatile uint32_t *p = g_diram
         ? (volatile uint32_t *)esp_ptr_diram_iram_to_dram((void *)(uintptr_t)instr_addr)
         : (volatile uint32_t *)(uintptr_t)instr_addr;
     *p = w;
+#endif
 }
 
 void jit_exec_icache_sync(void)
