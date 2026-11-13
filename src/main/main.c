@@ -541,12 +541,14 @@ static void cpu_task(void *param)
         if (br != INPUT_BR_NONE)
             run_br_with_confirm(br == INPUT_BR_RESTORE);
 
-        /* Debug-console key injection: same path, arbitrary key. */
+        /* Physical-button and debug-console key injection via EvtEnqueueKey. */
         input_key_event_t kev;
         while (input_pop_key(&kev)) {
-            uint32_t h = inject_key_event(kev.ascii, kev.keycode, kev.modifiers);
-            if (h) ESP_LOGI(TAG, "console key %04X injected -> EvtEnqueueKey=%08lX",
-                            kev.ascii, (unsigned long)h);
+            if (!db_is_asleep()) {
+                uint32_t h = inject_key_event(kev.ascii, kev.keycode, kev.modifiers);
+                if (h) ESP_LOGI(TAG, "key %04X injected -> EvtEnqueueKey=%08lX",
+                                kev.ascii, (unsigned long)h);
+            }
         }
 
         /* UART RX: bytes pushed by a producer (the serial bridge, or the debug

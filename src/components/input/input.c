@@ -104,9 +104,9 @@ int input_pop_br_request(void)
 #define PIN_INT         10
 #define PIN_TOUCH_PWR   2
 #define PIN_TOUCH_RST   4
-#define PIN_BTN_L       0    /* Up button   -> Page Up / >=1s hold = Backup  */
-#define PIN_BTN_M       3    /* Power btn   -> >=1s hold = Sleep/Wake        */
-#define PIN_BTN_R       7    /* Down button -> Page Down / >=1s hold = Restore */
+#define PIN_BTN_L       0    /* Up button   -> Page Up (vchrPageUp) / >=1s hold = Backup  */
+#define PIN_BTN_M       3    /* Power btn   -> Home (vchrLaunch) / >=1s hold = Sleep/Wake */
+#define PIN_BTN_R       7    /* Down button -> Page Down (vchrPageDown) / >=1s hold = Restore */
 #define I2C_BUS_SPEED   100000
 #define CW2017_ADDR     0x63
 #define CW2017_REG_VCELL 0x02
@@ -147,11 +147,9 @@ static bool last_btn_l = false;
 static bool last_btn_m = false;
 static bool last_btn_r = false;
 /* Long-hold timing for the UP/DOWN side buttons (backup/restore trigger) plus
- * the deferred-tap pulse that lets a short tap still send a single page key. */
+ * the deferred-tap release that emits a single key event on short tap. */
 static TickType_t l_press_tick = 0, r_press_tick = 0;
 static bool l_hold_fired = false, r_hold_fired = false;
-static int  tap_row = -1, tap_col = 0;   /* page key held for a tap; row < 0 = idle */
-static TickType_t tap_pulse_until = 0;
 static uint32_t poll_diag_count = 0;
 
 int input_get_battery_mv(void)
@@ -442,27 +440,18 @@ esp_err_t input_init(void)
     return ESP_OK;
 }
 
-#define BR_HOLD_MS   1000     /* hold >= this -> backup/restore request */
-#define TAP_PULSE_MS 60       /* a deferred tap holds the page key this long */
+#define BR_HOLD_MS      1000     /* hold >= this -> backup/restore request */
+#define VCHR_PAGE_UP    0x000B   /* vchrPageUp (chrPageUp) */
+#define VCHR_PAGE_DOWN  0x000C   /* vchrPageDown (chrPageDown) */
+#define VCHR_LAUNCH     0x0108   /* vchrLaunch (Home / Applications) */
+#define CMD_KEY_MASK    0x0008   /* commandKeyMask */
 
-/* Release the deferred-tap page key once its short pulse has elapsed. Called
- * every input_poll() cycle. */
-static void tap_pulse_service(void)
-{
-    if (tap_row >= 0 && (int32_t)(xTaskGetTickCount() - tap_pulse_until) >= 0) {
-        db_kbd_set(tap_row, tap_col, false);
-        tap_row = -1;
-    }
-}
-
-/* Deferred-tap + long-hold handling for one UP/DOWN side button. The page key is
- * NOT asserted on press (unlike a plain edge->matrix mapping): a short tap
- * (< BR_HOLD_MS) emits a single page key on release — held TAP_PULSE_MS so the
- * ROM's matrix scan catches it — while a >= BR_HOLD_MS hold latches a backup/
- * restore request instead and suppresses the tap. Mirrors the middle-button
- * hold. `row,col` is the page key (KBD_KEY_PGUP/PGDN expands to both args). */
+/* Deferred-tap + long-hold handling for one UP/DOWN side button. A short tap
+ * (< BR_HOLD_MS) enqueues a Palm OS virtual key event on release via
+ * input_inject_key(), while a >= BR_HOLD_MS hold latches a backup/restore
+ * request instead and suppresses the tap. Mirrors the middle-button hold. */
 static void handle_hold_button(bool pressed, bool *last, TickType_t *press_tick,
-                               bool *hold_fired, int row, int col,
+                               bool *hold_fired, uint16_t vchr,
                                input_br_req_t req)
 {
     TickType_t now = xTaskGetTickCount();
@@ -478,16 +467,9 @@ static void handle_hold_button(bool pressed, bool *last, TickType_t *press_tick,
                      req == INPUT_BR_BACKUP ? "BACKUP" : "RESTORE");
         }
     } else if (!pressed && *last) {           /* release edge */
-        if (!*hold_fired) {                   /* short tap -> one page key pulse */
-            /* The pulse slot is shared by UP and DOWN (different cols, same row); if a
-             * prior tap's pulse is still in flight, release ITS key before claiming the
-             * slot, or that key would stay asserted forever (only the last-claimed col
-             * is ever cleared by tap_pulse_service). */
-            if (tap_row >= 0)
-                db_kbd_set(tap_row, tap_col, false);
-            db_kbd_set(row, col, true);
-            tap_row = row; tap_col = col;
-            tap_pulse_until = now + pdMS_TO_TICKS(TAP_PULSE_MS);
+        if (!*hold_fired) {                   /* short tap -> enqueue Palm OS key */
+            input_inject_key(vchr, 0, CMD_KEY_MASK);
+            ESP_LOGI(TAG, "BTN tap -> key 0x%04X", vchr);
         }
     }
     *last = pressed;
@@ -572,25 +554,25 @@ void input_poll(void)
     }
 
     /* --- Hardware buttons (active low). UP/DOWN (Left/Right) tap = Palm page
-     * up/down; a >= 1s hold latches a backup (UP) / restore (DOWN) request that
-     * the CPU task confirms with an on-panel countdown (see main.c). Holding no
-     * longer auto-repeat-scrolls — the page key is deferred to the tap-release.
-     * MIDDLE is the POWER (sleep/wake) button: a hold of >= 1s while awake
-     * injects vchrHardPower so the running OS sleeps. There is no Home mapping
-     * (Home is reached by tapping the on-screen silkscreen icon). Waking from
-     * sleep is handled by the ESP32 light-sleep GPIO wake + a >=1s re-hold check
-     * in the CPU task (main.c), which then pulses the matrix POWER key — while
-     * asleep this input task isn't running, so no asleep branch is needed. */
+     * up/down (vchrPageUp/vchrPageDown via EvtEnqueueKey); a >= 1s hold latches
+     * a backup (UP) / restore (DOWN) request that the CPU task confirms with an
+     * on-panel countdown (see main.c).
+     * MIDDLE is the POWER / Home button: a short tap (< 1s) enqueues
+     * vchrLaunch (Home / Applications Launcher), while a hold of >= 1s while
+     * awake injects vchrHardPower so the running OS sleeps. Waking from sleep is
+     * handled by the ESP32 light-sleep GPIO wake + a >=1s re-hold check in the
+     * CPU task (main.c), which then pulses the matrix POWER key — while asleep
+     * this input task isn't running, so no asleep branch is needed. */
     bool btn_l = !gpio_get_level(PIN_BTN_L);
     bool btn_m = !gpio_get_level(PIN_BTN_M);
     bool btn_r = !gpio_get_level(PIN_BTN_R);
 
     handle_hold_button(btn_l, &last_btn_l, &l_press_tick, &l_hold_fired,
-                       KBD_KEY_PGUP, INPUT_BR_BACKUP);
+                       VCHR_PAGE_UP, INPUT_BR_BACKUP);
 
-    /* Middle button: awake long-hold (>= 1s) = Power -> sleep. vchrHardPower is
-     * delivered via the EvtEnqueueKey syscall (the running event loop ignores
-     * the matrix->event path for power). */
+    /* Middle button: short tap (< 1s) = Home (vchrLaunch); awake long-hold
+     * (>= 1s) = Power -> sleep. Both are delivered via EvtEnqueueKey (the
+     * running event loop ignores the matrix->event path for power). */
     #define MID_POWER_HOLD_MS 1000
     static TickType_t mid_press_tick = 0;
     static bool mid_power_fired = false;   /* this press already produced a POWER action */
@@ -604,11 +586,14 @@ void input_poll(void)
             mid_power_fired = true;
             ESP_LOGI(TAG, "POWER (hold) -> vchrHardPower");
         }
+    } else if (!btn_m && last_btn_m) {          /* release edge */
+        if (!mid_power_fired) {
+            input_inject_key(VCHR_LAUNCH, 0, CMD_KEY_MASK);
+            ESP_LOGI(TAG, "POWER (tap) -> vchrLaunch");
+        }
     }
     last_btn_m = btn_m;
 
     handle_hold_button(btn_r, &last_btn_r, &r_press_tick, &r_hold_fired,
-                       KBD_KEY_PGDN, INPUT_BR_RESTORE);
-
-    tap_pulse_service();
+                       VCHR_PAGE_DOWN, INPUT_BR_RESTORE);
 }
