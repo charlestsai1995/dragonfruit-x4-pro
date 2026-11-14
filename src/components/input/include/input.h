@@ -19,11 +19,14 @@ void input_poll(void);
  * available. Safe to call from a different task than input_poll(). */
 bool input_pop_pen_event(input_pen_event_t *out);
 
-/* Non-blocking: returns true once per Power-button press while AWAKE (consumes
- * the latch). Consumed by the CPU task, which injects vchrHardPower via
- * EvtEnqueueKey to trigger sleep. (Waking from sleep uses the matrix POWER key
- * directly, not this latch — see input.c.) */
+/* Non-blocking: returns true once per short Power-button press while AWAKE
+ * (consumes the latch). Consumed by the CPU task, which injects vchrHardPower
+ * via EvtEnqueueKey to trigger sleep/suspend. */
 bool input_pop_power_key(void);
+
+/* Non-blocking: returns true once per long Power-button hold while AWAKE
+ * (consumes the latch). Consumed by the CPU task to shut down the device. */
+bool input_pop_power_off(void);
 
 /* Backup/restore request, latched once per >=1s hold of a side button while
  * awake: UP (PIN_BTN_L) = backup, DOWN (PIN_BTN_R) = restore. A short tap of the

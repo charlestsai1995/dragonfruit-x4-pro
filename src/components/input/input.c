@@ -63,7 +63,7 @@ bool input_pop_key(input_key_event_t *out)
     return xQueueReceive(key_queue, out, 0) == pdTRUE;
 }
 
-/* Latched once per awake Power-button press; drained by the CPU task. */
+/* Latched once per awake Power-button short press; drained by the CPU task. */
 static volatile bool power_key_pending = false;
 
 bool input_pop_power_key(void)
@@ -71,6 +71,17 @@ bool input_pop_power_key(void)
     if (!power_key_pending)
         return false;
     power_key_pending = false;
+    return true;
+}
+
+/* Latched once per awake Power-button long-hold; drained by the CPU task. */
+static volatile bool power_off_pending = false;
+
+bool input_pop_power_off(void)
+{
+    if (!power_off_pending)
+        return false;
+    power_off_pending = false;
     return true;
 }
 
@@ -105,7 +116,7 @@ int input_pop_br_request(void)
 #define PIN_TOUCH_PWR   2
 #define PIN_TOUCH_RST   4
 #define PIN_BTN_L       0    /* Up button   -> Page Up (vchrPageUp) / >=1s hold = Backup  */
-#define PIN_BTN_M       3    /* Power btn   -> Home (vchrLaunch) / >=1s hold = Sleep/Wake */
+#define PIN_BTN_M       3    /* Power btn   -> short = Suspend/Resume, hold = Shutdown */
 #define PIN_BTN_R       7    /* Down button -> Page Down (vchrPageDown) / >=1s hold = Restore */
 #define I2C_BUS_SPEED   100000
 #define CW2017_ADDR     0x63
@@ -146,6 +157,8 @@ static int16_t last_px = -1, last_py = -1;   /* last streamed stroke point */
 static bool last_btn_l = false;
 static bool last_btn_m = false;
 static bool last_btn_r = false;
+static bool last_cap_home = false;
+static uint8_t cap_home_idle_polls = 0;
 /* Long-hold timing for the UP/DOWN side buttons (backup/restore trigger) plus
  * the deferred-tap release that emits a single key event on short tap. */
 static TickType_t l_press_tick = 0, r_press_tick = 0;
@@ -492,6 +505,19 @@ void input_poll(void)
         }
 
         if (err == ESP_OK && (status & 0x80)) {
+            bool have_key = (status & 0x10) != 0;
+            if (have_key) {
+                cap_home_idle_polls = 0;
+                if (!last_cap_home) {
+                    input_inject_key(VCHR_LAUNCH, 0, CMD_KEY_MASK);
+                    ESP_LOGI(TAG, "CAP HOME -> vchrLaunch");
+                }
+                last_cap_home = true;
+            } else {
+                last_cap_home = false;
+                cap_home_idle_polls = 0;
+            }
+
             uint8_t num_fingers = status & 0x0F;
 
             if (num_fingers > 0) {
@@ -550,6 +576,11 @@ void input_poll(void)
             }
 
             gt911_write_byte(GT911_STATUS_REG, 0x00);
+        } else if (err == ESP_OK && last_cap_home) {
+            if (++cap_home_idle_polls >= 5) {
+                last_cap_home = false;
+                cap_home_idle_polls = 0;
+            }
         }
     }
 
@@ -557,12 +588,11 @@ void input_poll(void)
      * up/down (vchrPageUp/vchrPageDown via EvtEnqueueKey); a >= 1s hold latches
      * a backup (UP) / restore (DOWN) request that the CPU task confirms with an
      * on-panel countdown (see main.c).
-     * MIDDLE is the POWER / Home button: a short tap (< 1s) enqueues
-     * vchrLaunch (Home / Applications Launcher), while a hold of >= 1s while
-     * awake injects vchrHardPower so the running OS sleeps. Waking from sleep is
-     * handled by the ESP32 light-sleep GPIO wake + a >=1s re-hold check in the
-     * CPU task (main.c), which then pulses the matrix POWER key — while asleep
-     * this input task isn't running, so no asleep branch is needed. */
+     * MIDDLE is the POWER button: a short press (< 1.5s) suspends while awake
+     * (vchrHardPower via EvtEnqueueKey) or resumes from light sleep; a long
+     * hold (>= 1.5s) shuts down the device (both while awake and while
+     * suspended; see main.c). The capacitive Home button (GT911 HaveKey) maps
+     * to vchrLaunch (Home / Applications Launcher). */
     bool btn_l = !gpio_get_level(PIN_BTN_L);
     bool btn_m = !gpio_get_level(PIN_BTN_M);
     bool btn_r = !gpio_get_level(PIN_BTN_R);
@@ -570,10 +600,9 @@ void input_poll(void)
     handle_hold_button(btn_l, &last_btn_l, &l_press_tick, &l_hold_fired,
                        VCHR_PAGE_UP, INPUT_BR_BACKUP);
 
-    /* Middle button: short tap (< 1s) = Home (vchrLaunch); awake long-hold
-     * (>= 1s) = Power -> sleep. Both are delivered via EvtEnqueueKey (the
-     * running event loop ignores the matrix->event path for power). */
-    #define MID_POWER_HOLD_MS 1000
+    /* Middle button: short press (< 1.5s) = Suspend (vchrHardPower); awake
+     * long-hold (>= 1.5s) = Shut down. */
+    #define MID_POWER_OFF_HOLD_MS 1500
     static TickType_t mid_press_tick = 0;
     static bool mid_power_fired = false;   /* this press already produced a POWER action */
     if (btn_m && !last_btn_m) {                 /* press edge */
@@ -581,15 +610,15 @@ void input_poll(void)
         mid_power_fired = false;
     } else if (btn_m && last_btn_m) {           /* held */
         if (!mid_power_fired &&
-            (xTaskGetTickCount() - mid_press_tick) >= pdMS_TO_TICKS(MID_POWER_HOLD_MS)) {
-            power_key_pending = true;
+            (xTaskGetTickCount() - mid_press_tick) >= pdMS_TO_TICKS(MID_POWER_OFF_HOLD_MS)) {
+            power_off_pending = true;
             mid_power_fired = true;
-            ESP_LOGI(TAG, "POWER (hold) -> vchrHardPower");
+            ESP_LOGI(TAG, "POWER (long hold) -> shutdown");
         }
     } else if (!btn_m && last_btn_m) {          /* release edge */
         if (!mid_power_fired) {
-            input_inject_key(VCHR_LAUNCH, 0, CMD_KEY_MASK);
-            ESP_LOGI(TAG, "POWER (tap) -> vchrLaunch");
+            power_key_pending = true;
+            ESP_LOGI(TAG, "POWER (short press) -> vchrHardPower");
         }
     }
     last_btn_m = btn_m;

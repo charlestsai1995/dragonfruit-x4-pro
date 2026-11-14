@@ -34,9 +34,10 @@ static volatile uint32_t total_cycles = 0;
 
 #if CONFIG_IDF_TARGET_ESP32S3
 /* Xteink X4 Pro: Power button = GPIO3 (active-low), Power latch = GPIO1 (active-high),
- * Frontlight = GPIO8 (Cool) & GPIO9 (Warm). */
+ * Touch power = GPIO2 (active-low), Frontlight = GPIO8 (Cool) & GPIO9 (Warm). */
 #define PIN_BTN_POWER     GPIO_NUM_3
 #define PIN_POWER_LATCH   GPIO_NUM_1
+#define PIN_TOUCH_PWR     GPIO_NUM_2
 #define PIN_FL_COOL       GPIO_NUM_8
 #define PIN_FL_WARM       GPIO_NUM_9
 #else
@@ -44,7 +45,8 @@ static volatile uint32_t total_cycles = 0;
  * wake-sleep button and the light-sleep wake source. */
 #define PIN_BTN_POWER     GPIO_NUM_38
 #endif
-#define POWER_HOLD_MS     1000     /* >=1s hold to wake from light sleep */
+#define POWER_OFF_HOLD_MS 1500     /* >=1.5s hold to shut down */
+#define POWER_WAKE_MIN_MS   40     /* >=40ms press to wake from light sleep (debounce) */
 
 /* MC68EZ328 core clock. The IIIx clocks the DragonBall EZ at 16.58 MHz; the cpu
  * task runs CYCLES_PER_BATCH (~1 ms of emulated time) per iteration and reports
@@ -377,11 +379,42 @@ static void run_br_with_confirm(bool restore)
     unpark_io_tasks();
 }
 
+/* Shut down the device on a long-press of the Power button. Parks I/O tasks if
+ * not already parked, blanks the e-ink panel, waits for the power button to be
+ * released, cuts the X4 Pro battery power latch (GPIO 1 LOW), and enters deep
+ * sleep as a fallback when USB power keeps VBUS alive. */
+static void shutdown_device(bool already_parked)
+{
+    ESP_LOGI(TAG, "SHUTDOWN: powering off device");
+    if (!already_parked)
+        park_io_tasks(1000);
+
+    display_blank_for_sleep();
+
+    for (int i = 0; i < 250 && gpio_get_level(PIN_BTN_POWER) == 0; i++)
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+#if CONFIG_IDF_TARGET_ESP32S3
+    gpio_hold_dis(PIN_FL_COOL);
+    gpio_set_level(PIN_FL_COOL, 0);
+    gpio_hold_dis(PIN_FL_WARM);
+    gpio_set_level(PIN_FL_WARM, 0);
+    gpio_hold_dis(PIN_TOUCH_PWR);
+    gpio_set_direction(PIN_TOUCH_PWR, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_TOUCH_PWR, 1);       /* disable active-low touch rail */
+    gpio_hold_dis(PIN_POWER_LATCH);
+    gpio_set_level(PIN_POWER_LATCH, 0);     /* release battery power latch */
+    vTaskDelay(pdMS_TO_TICKS(100));
+#endif
+
+    esp_deep_sleep_start();
+}
+
 /* When the emulated device is in PLL-off sleep, power the ESP32 down into light
  * sleep (preserving RAM/CPU state and PSRAM). Quiesce the display+input tasks,
- * blank the panel, arm the power button as the wake source, and sleep. On a
- * deliberate >=1s button hold, repaint and wake the emulated device; a shorter
- * bump just re-sleeps. Called once per batch from the CPU task. */
+ * blank the panel, arm the power button as the wake source, and sleep. A short
+ * button press resumes the emulated device; a long hold (>=1.5s) shuts down;
+ * a brief glitch (<40ms) re-sleeps. Called once per batch from the CPU task. */
 static void maybe_enter_light_sleep(void)
 {
     if (!park_eg || !db_is_asleep() || !cpu.regs.stopped)
@@ -416,15 +449,23 @@ static void maybe_enter_light_sleep(void)
         ESP_LOGI(TAG, "SLEEP ESP32 ENTER");
         esp_light_sleep_start();           /* whole SoC halts; resumes here on wake */
 
-        /* Woke because the power button (GPIO38) went low. Require a >=1s hold to
-         * treat it as a deliberate wake; otherwise re-sleep (bump rejection). */
-        bool held = true;
-        for (int i = 0; i < POWER_HOLD_MS / 20; i++) {
-            if (gpio_get_level(PIN_BTN_POWER) != 0) { held = false; break; }
+        /* Woke because the power button went low. Measure hold duration:
+         *   - >= POWER_OFF_HOLD_MS (1.5s): shut down the device
+         *   - >= POWER_WAKE_MIN_MS (40ms): short press -> resume
+         *   - <  POWER_WAKE_MIN_MS: bounce/glitch -> re-sleep */
+        int held_ms = 0;
+        while (gpio_get_level(PIN_BTN_POWER) == 0 && held_ms < POWER_OFF_HOLD_MS) {
             vTaskDelay(pdMS_TO_TICKS(20));
+            held_ms += 20;
         }
-        if (held) break;
-        ESP_LOGI(TAG, "SLEEP ESP32 wake bump (<1s) — back to sleep");
+        if (held_ms >= POWER_OFF_HOLD_MS) {
+            gpio_wakeup_disable(PIN_BTN_POWER);
+            shutdown_device(true);
+            return;
+        }
+        if (held_ms >= POWER_WAKE_MIN_MS)
+            break;
+        ESP_LOGI(TAG, "SLEEP ESP32 wake glitch (<%dms) — back to sleep", POWER_WAKE_MIN_MS);
     }
     gpio_wakeup_disable(PIN_BTN_POWER);
 #if CONFIG_IDF_TARGET_ESP32S3
@@ -523,10 +564,15 @@ static void cpu_task(void *param)
             #undef RDRAM32
         }
 
-        /* Power button (awake long-hold): inject vchrHardPower so the running OS
-         * sleeps. The ROM's own matrix scan decodes this key but the running
-         * event loop never acts on that event; the syscall path is the one that
-         * is processed. Waking uses the matrix key instead. */
+        /* Power button (awake long-hold): shut down the device. */
+        if (input_pop_power_off()) {
+            shutdown_device(false);
+        }
+
+        /* Power button (awake short press): inject vchrHardPower so the running
+         * OS suspends. The ROM's own matrix scan decodes this key but the
+         * running event loop never acts on that event; the syscall path is the
+         * one that is processed. Waking uses the matrix key instead. */
         if (input_pop_power_key()) {
             uint32_t h = inject_key_event(0x0208 /*vchrHardPower*/, 0, 0x0008 /*commandKeyMask*/);
             if (h) ESP_LOGI(TAG, "POWER key injected -> EvtEnqueueKey=%08lX", (unsigned long)h);
