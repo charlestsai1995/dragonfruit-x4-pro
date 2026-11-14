@@ -98,6 +98,7 @@ volatile bool g_warm_reset_request = false;        /* console "reset" / batch re
  * warm reset. Only the two request booleans + arg cross threads; the rest is
  * cpu-task-private and read racily by `backup status`. */
 backup_runtime_t g_backup = { .last = BACKUP_OK };
+static volatile bool g_boot_restore_pending = false;
 
 /* Yield hook the installer calls every 32 records so a large .pdb install can't
  * starve the core-1 idle task past the 5 s task-watchdog window. */
@@ -287,7 +288,7 @@ static void run_sd_op(int kind, const char *name)
         ESP_LOGW(TAG, "%s: OS not ready", what);
         return;
     }
-    if (!park_io_tasks(1000)) {           /* shared SPI bus — do NOT proceed unparked */
+    if (!park_io_tasks(3000)) {           /* shared SPI bus — do NOT proceed unparked */
         g_backup.last = BACKUP_ERR_BUSY;
         g_backup.phase = BR_DONE;
         ESP_LOGW(TAG, "%s: I/O tasks did not park; aborting (retry)", what);
@@ -387,7 +388,18 @@ static void shutdown_device(bool already_parked)
 {
     ESP_LOGI(TAG, "SHUTDOWN: powering off device");
     if (!already_parked)
-        park_io_tasks(1000);
+        park_io_tasks(3000);
+
+    if (db_is_asleep())
+        wake_emulated_device();
+
+    if (run_br_ready(false)) {
+        ESP_LOGI(TAG, "SHUTDOWN: backing up RAM databases to SD /backup");
+        display_show_message("BACKING UP\n\nSHUTTING DOWN");
+        run_br_engine(false, NULL);
+    } else {
+        ESP_LOGW(TAG, "SHUTDOWN: OS not ready; skipping backup");
+    }
 
     display_blank_for_sleep();
 
@@ -680,12 +692,24 @@ static void cpu_task(void *param)
                          g_install.ok, g_install.fail,
                          pr.need_warm_reset ? " — warm reset" : "");
                 /* A reset-after-install DB supersedes the launcher kick (the warm
-                 * reboot repaints everything); both run on this cpu task. */
-                if (pr.need_warm_reset)        g_warm_reset_request = true;
-                else if (pr.need_launcher_kick) installer_refresh_launcher(&cpu);
+                 * reboot repaints everything); both run on this cpu task. Hold off
+                 * if a boot restore is queued so we warm-reset once after it finishes. */
+                if (!g_boot_restore_pending) {
+                    if (pr.need_warm_reset)        g_warm_reset_request = true;
+                    else if (pr.need_launcher_kick) installer_refresh_launcher(&cpu);
+                }
                 g_install.phase = INST_DONE;
                 g_install.force = false;
             }
+        }
+
+        if (g_boot_restore_pending &&
+            (g_install.phase == INST_IDLE || g_install.phase == INST_DONE) &&
+            installer_os_settled(&cpu, installer_os_ready(),
+                                 db_lcd_framebuffer_addr(), false, &g_install.pump)) {
+            g_boot_restore_pending = false;
+            ESP_LOGI(TAG, "boot-restore: restoring databases from SD /backup");
+            run_sd_op(BR_REQ_RESTORE, NULL);
         }
 
         /* Console-requested backup / restore (one-shot). Serviced here on the cpu
@@ -945,6 +969,10 @@ static void display_task(void *param)
             while (esp32_powersave_requested) vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        if (g_boot_restore_pending) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
         if (g_wave_benchmark_request) {
             display_run_waveform_benchmark();   /* runs on this task = sole SPI owner */
             g_wave_benchmark_request = false;
@@ -1079,6 +1107,7 @@ void app_main(void)
     installer_scan_sd(&g_install.set);
     g_install.phase = g_install.set.count ? INST_WAIT : INST_IDLE;
     g_installer_yield = installer_yield_cb;
+    g_boot_restore_pending = backup_has_sd_files();
 
     bus_init(rom_data, rom_size);
     dragonball_init();

@@ -135,6 +135,11 @@ typedef struct {
 } backup_runtime_t;
 
 #ifndef HOST_BUILD
+/* Device: mount the SD and return true if /sdcard/backup exists and contains at
+ * least one .prc/.pdb/.pqa file, then unmount. Intended for the boot SD window
+ * before emulator tasks start. */
+bool backup_has_sd_files(void);
+
 /* Device: mount the SD, back up matching card-0 RAM databases to /sdcard/backup
  * (overwriting same-named files), unmount. name==NULL/"" backs up every RAM DB that
  * either carries the backup flag (dmHdrAttrBackup) OR belongs to a built-in PIM app

@@ -180,6 +180,11 @@ typedef struct {
     volatile bool          force;  /* console -> cpu: "install now"              */
 } install_runtime_t;
 
+/* Returns true once the OS has settled past early bring-up, finished UIInitialize,
+ * and passed the dynamic-heap probe (installer_probe_heap). */
+bool installer_os_settled(m68k_cpu_t *cpu, bool osready, uint32_t current_fb,
+                          bool force, installer_pump_state_t *state);
+
 /* osready  = installer_os_ready() result; current_fb = db_lcd_framebuffer_addr();
  * force    = bypass the cheap settle pre-gate (the probe still runs). */
 installer_pump_result_t installer_pump(install_set_t *set, m68k_cpu_t *cpu,

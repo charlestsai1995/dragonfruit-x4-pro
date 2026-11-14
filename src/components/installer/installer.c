@@ -757,29 +757,9 @@ static uint32_t installer_fb_cksum(uint32_t fb)
     return s;
 }
 
-installer_pump_result_t installer_pump(install_set_t *set, m68k_cpu_t *cpu,
-                                       bool osready, uint32_t current_fb,
-                                       bool force, installer_pump_state_t *st)
+bool installer_os_settled(m68k_cpu_t *cpu, bool osready, uint32_t current_fb,
+                          bool force, installer_pump_state_t *st)
 {
-    installer_pump_result_t res = { 0, false, false, NULL };
-
-    /* All images attempted: report completion and what the caller should do.
-     * A reset-after-install DB supersedes the launcher kick (the warm reboot
-     * repaints everything anyway). */
-    if (set->next >= set->count) {
-        res.status = 1;
-        bool any_ok = false, any_reset = false;
-        for (int i = 0; i < set->count; i++) {
-            if (set->img[i].status == IMG_INSTALLED) {
-                any_ok = true;
-                if (set->img[i].result == INSTALLER_NEEDS_RESET) any_reset = true;
-            }
-        }
-        res.need_warm_reset    = any_reset;
-        res.need_launcher_kick = any_ok && !any_reset;
-        return res;
-    }
-
     /* Cheap pre-gate: don't drive any trap until the OS is settled. The boot->UI
      * framebuffer ADDRESS switch (the Window Manager allocating the UI surface) is
      * NOT enough — it fires a hair too early, while the boot splash is still on
@@ -803,27 +783,56 @@ installer_pump_result_t installer_pump(install_set_t *set, m68k_cpu_t *cpu,
         else if (cks != st->ui_cksum) st->settled = true;            /* launcher drawn */
     }
     if (cpu->regs.stopped) st->settled = true;             /* an idle STOP also settles */
-    if (!osready || !(st->settled || force)) return res;   /* keep waiting */
+    if (!osready || !(st->settled || force)) return false; /* keep waiting */
 
     /* Authoritative readiness: wait for the OS to FINISH UIInitialize (sysTrap
      * 0xA1A6) — mirrors CloudpilotEmu's IsUIInitialized() install gate. The
      * framebuffer-switch settle above fires a hair too early, during UI-subsystem
      * init; driving our homebrew Dm/Mem trap sequence then reenters the OS mid-init
      * and corrupts its state (a task stack ends up overlapping an AMX system pool,
-     * so the device crashes after the install completes — and the more apps we
+     * so the device crashes after the work completes — and the more apps we
      * install in that window, the more reliably it does). This is NOT bypassable by
      * `force`: installing before UIInitialize always corrupts the OS, whoever asked.
      * `force` only skips the idle/settle pre-gate above, never this safety gate. */
-    if (!m68k_ui_initialized()) return res;
+    if (!m68k_ui_initialized()) return false;
 
     /* Authoritative readiness: a MemPtrNew round-trip, retried each tick until it
      * passes. The probe and the install run in the SAME call, so there is no
      * window for the OS to doze in between — once the probe passes we install,
      * once, with no per-image retry. */
     if (!st->heap_confirmed) {
-        if (!installer_probe_heap(cpu)) return res;        /* not ready yet */
+        if (!installer_probe_heap(cpu)) return false;      /* not ready yet */
         st->heap_confirmed = true;
     }
+
+    return true;
+}
+
+installer_pump_result_t installer_pump(install_set_t *set, m68k_cpu_t *cpu,
+                                       bool osready, uint32_t current_fb,
+                                       bool force, installer_pump_state_t *st)
+{
+    installer_pump_result_t res = { 0, false, false, NULL };
+
+    /* All images attempted: report completion and what the caller should do.
+     * A reset-after-install DB supersedes the launcher kick (the warm reboot
+     * repaints everything anyway). */
+    if (set->next >= set->count) {
+        res.status = 1;
+        bool any_ok = false, any_reset = false;
+        for (int i = 0; i < set->count; i++) {
+            if (set->img[i].status == IMG_INSTALLED) {
+                any_ok = true;
+                if (set->img[i].result == INSTALLER_NEEDS_RESET) any_reset = true;
+            }
+        }
+        res.need_warm_reset    = any_reset;
+        res.need_launcher_kick = any_ok && !any_reset;
+        return res;
+    }
+
+    if (!installer_os_settled(cpu, osready, current_fb, force, st))
+        return res;
 
     /* Install one image this tick (a full emulation batch runs between calls so
      * the OS commits each). Past the probe the OS is up, so any failure is a
@@ -1585,6 +1594,25 @@ backup_result_t backup_run_to_sd(m68k_cpu_t *cpu, const char *name,
     return BACKUP_OK;
 }
 
+bool backup_has_sd_files(void)
+{
+    sdmmc_card_t *card = NULL;
+    if (m5_sd_mount(&card) != ESP_OK) {
+        ESP_LOGW(TAG, "SD mount failed; skipping boot restore check");
+        return false;
+    }
+    char first[1][INSTALL_NAME_MAX];
+    int nn = scan_sd_names(BACKUP_DIR, first, 1, NULL);
+    m5_sd_unmount(card);
+    if (nn > 0) {
+        ESP_LOGI(TAG, "backup check: %s populated (first=%s); boot restore queued",
+                 BACKUP_DIR, first[0]);
+        return true;
+    }
+    ESP_LOGI(TAG, "backup check: nothing to restore in %s", BACKUP_DIR);
+    return false;
+}
+
 backup_result_t backup_restore_from_sd(m68k_cpu_t *cpu, const char *name,
                                        int *ok, int *fail, bool *needs_reset)
 {
@@ -1596,15 +1624,20 @@ backup_result_t backup_restore_from_sd(m68k_cpu_t *cpu, const char *name,
         return BACKUP_ERR_IO;
     }
 
-    /* names[] static to keep it off the cpu task's bounded stack; safe because restore
-     * runs only on the cpu task in the parked SD window (no reentrancy). */
-    static char names[INSTALL_MAX_FILES][INSTALL_NAME_MAX];
-    int nn = scan_sd_names(BACKUP_DIR, names, INSTALL_MAX_FILES, name);
+    /* Heap-allocate names[] in PSRAM so a full backup set (>16 DBs) restores
+     * cleanly without eating the cpu task's bounded stack. */
+    char (*names)[INSTALL_NAME_MAX] = bk_alloc((size_t)BACKUP_MAX_DBS * INSTALL_NAME_MAX);
+    if (!names) {
+        m5_sd_unmount(card);
+        return BACKUP_ERR_OUT_OF_MEMORY;
+    }
+    int nn = scan_sd_names(BACKUP_DIR, names, BACKUP_MAX_DBS, name);
     if (nn <= 0) {
         /* dir absent (-1) or nothing matching (0): "nothing to restore" is success with
          * zero counts, NOT an I/O error (the old BACKUP_ERR_IO read as "sd/file io error"
          * on the console for a benign empty/absent /backup). */
         ESP_LOGI(TAG, "restore: nothing to restore in %s", BACKUP_DIR);
+        bk_free(names);
         m5_sd_unmount(card);
         return BACKUP_OK;
     }
@@ -1632,6 +1665,7 @@ backup_result_t backup_restore_from_sd(m68k_cpu_t *cpu, const char *name,
         if (g_installer_yield) g_installer_yield();   /* feed the watchdog between files */
     }
 
+    bk_free(names);
     m5_sd_unmount(card);
     ESP_LOGI(TAG, "restore complete: %d ok, %d failed", *ok, *fail);
     return BACKUP_OK;
