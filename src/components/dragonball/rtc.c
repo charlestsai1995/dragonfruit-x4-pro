@@ -114,9 +114,25 @@ void db_rtc_advance(uint32_t cpu_cycles)
 
     time_t now = time(NULL);
 
-    /* Re-base in O(1) if SNTP steps the wall clock backwards or ahead by >60s. */
-    if (now < rtc_last_real || (now - rtc_last_real) > 60) {
+    /* Re-base in O(1) if SNTP steps the wall clock backwards or >1 year. */
+    if (now < rtc_last_real || (now - rtc_last_real) > (time_t)(86400 * 365)) {
         rtc_seed();
+        db_rtc_update_interrupt();
+        return;
+    }
+
+    /* Fast-forward in O(1) across normal long sleeps (>60s up to 1 year) so
+     * manual clocks without NTP stay intact and midnight crossings roll over. */
+    time_t delta = now - rtc_last_real;
+    if (delta > 60) {
+        uint64_t total_sec = (uint64_t)rtc_tod + (uint64_t)delta;
+        uint32_t days_passed = (uint32_t)(total_sec / 86400u);
+        rtc_tod = (uint32_t)(total_sec % 86400u);
+        rtc_day += days_passed;
+        rtc_last_real = now;
+        if (days_passed > 0 && (db.rtcienr & 0x08))
+            db.rtcisr |= 0x08;          /* 24Hr */
+        rtc_last_alarm_sec = (int32_t)rtc_tod;
         db_rtc_update_interrupt();
         return;
     }

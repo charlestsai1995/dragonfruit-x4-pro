@@ -553,6 +553,8 @@ static void maybe_enter_light_sleep(void)
      * (so the silkscreen redraw doesn't race the task's own SPI), then release. */
     display_resume_after_wake();
     wake_emulated_device();
+    if (wifi_ntp_is_synced())
+        g_ntp_apply_pending = true;
     unpark_io_tasks();
 }
 
