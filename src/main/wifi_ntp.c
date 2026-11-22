@@ -20,10 +20,11 @@
 
 static const char *TAG = "wifi_ntp";
 
-#define BIT_GOT_IP  (1 << 0)
-#define BIT_FAIL    (1 << 1)
-#define BIT_CANCEL  (1 << 2)
-#define BIT_DONE    (1 << 3)
+#define BIT_GOT_IP   (1 << 0)
+#define BIT_FAIL     (1 << 1)
+#define BIT_CANCEL   (1 << 2)
+#define BIT_DONE     (1 << 3)
+#define BIT_STOPPED  (1 << 4)
 
 #define WIFI_CONNECT_TIMEOUT_MS  15000
 #define SNTP_POLL_STEP_MS          500
@@ -33,10 +34,10 @@ static const char *TAG = "wifi_ntp";
 static wifi_ntp_config_t s_cfg;
 static bool              s_configured = false;
 static bool              s_infra_inited = false;
-static esp_netif_t      *s_sta_netif = NULL;
 static EventGroupHandle_t s_eg = NULL;
 
 static volatile bool             s_active = false;
+static volatile bool             s_stopping = false;
 static volatile bool             s_synced = false;
 static volatile bool             s_pending = false;
 static volatile wifi_ntp_state_t s_state = WIFI_NTP_DISABLED;
@@ -85,8 +86,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 {
     (void)arg;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        if (s_stopping || (xEventGroupGetBits(s_eg) & BIT_CANCEL))
+            return;
         esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_STOP) {
+        xEventGroupSetBits(s_eg, BIT_STOPPED);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_stopping)
+            return;
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)data;
         if (xEventGroupGetBits(s_eg) & BIT_CANCEL) {
             xEventGroupSetBits(s_eg, BIT_FAIL);
@@ -134,13 +141,6 @@ static esp_err_t ensure_network_infra(void)
         return err;
     }
 
-    if (!s_sta_netif)
-        s_sta_netif = esp_netif_create_default_wifi_sta();
-    if (!s_sta_netif) {
-        snprintf(s_err, sizeof(s_err), "netif STA create failed");
-        return ESP_FAIL;
-    }
-
     s_infra_inited = true;
     return ESP_OK;
 }
@@ -150,6 +150,7 @@ static void ntp_sync_task(void *param)
     (void)param;
     bool wifi_inited = false;
     bool wifi_started = false;
+    esp_netif_t *sta_netif = NULL;
     esp_event_handler_instance_t wifi_inst = NULL;
     esp_event_handler_instance_t ip_inst = NULL;
 
@@ -157,6 +158,13 @@ static void ntp_sync_task(void *param)
              s_cfg.ssid, s_cfg.ntp_server, s_cfg.tz);
 
     if (ensure_network_infra() != ESP_OK) {
+        s_state = WIFI_NTP_FAILED;
+        goto cleanup;
+    }
+
+    sta_netif = esp_netif_create_default_wifi_sta();
+    if (!sta_netif) {
+        snprintf(s_err, sizeof(s_err), "netif STA create failed");
         s_state = WIFI_NTP_FAILED;
         goto cleanup;
     }
@@ -269,13 +277,20 @@ static void ntp_sync_task(void *param)
     }
 
 cleanup:
+    s_stopping = true;
+    __sync_synchronize();
     if (wifi_started) {
-        esp_wifi_disconnect();
+        xEventGroupClearBits(s_eg, BIT_STOPPED);
         esp_wifi_stop();
+        xEventGroupWaitBits(s_eg, BIT_STOPPED, pdFALSE, pdTRUE, pdMS_TO_TICKS(2000));
     }
     if (ip_inst)   esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, ip_inst);
     if (wifi_inst) esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_inst);
-    if (wifi_inited) esp_wifi_deinit();
+    if (wifi_inited) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        esp_wifi_deinit();
+    }
+    if (sta_netif) esp_netif_destroy_default_wifi(sta_netif);
 
     s_active = false;
     xEventGroupSetBits(s_eg, BIT_DONE);
@@ -316,7 +331,8 @@ bool wifi_ntp_trigger(void)
     }
     if (s_active) return false;
 
-    xEventGroupClearBits(s_eg, BIT_GOT_IP | BIT_FAIL | BIT_CANCEL | BIT_DONE);
+    xEventGroupClearBits(s_eg, BIT_GOT_IP | BIT_FAIL | BIT_CANCEL | BIT_DONE | BIT_STOPPED);
+    s_stopping = false;
     s_err[0] = '\0';
     s_pending = false;
     s_state = WIFI_NTP_CONNECTING;
