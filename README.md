@@ -33,6 +33,9 @@ You supply the ROM. Palm OS is copyrighted and is not included here; see [Runnin
   restores the device's databases to the card.
 - Optional configurable on-screen layout: relocate or resize the silkscreen, rotate to
   landscape, or magnify, all from a file on the SD card.
+- Optional one-shot Wi-Fi NTP clock sync at boot: configured via `palm.cfg`, applies local
+  time to the guest Palm OS clock via `TimSetSeconds` after `/install` and `/backup` restore,
+  then shuts Wi-Fi back off.
 
 ## Portability
 
@@ -69,7 +72,8 @@ single-core, no-PSRAM parts such as the ESP32-C3.
 
 ```
 src/
-  main/             ESP-IDF entry point and the FreeRTOS tasks (CPU, display, input, battery)
+  main/             ESP-IDF entry point, FreeRTOS tasks (CPU, display, input, battery),
+                    debug console, serial bridge, and one-shot Wi-Fi NTP sync (wifi_ntp.c)
   components/
     m68k/           68000 interpreter (decode, addressing, ALU, move, branch, shift, bit,
                     BCD, system) plus the device-only burst JIT and its per-ISA backend
@@ -202,8 +206,8 @@ optional and can be added later.
 
 ```
 palm.rom         (required)  The Palm IIIx ROM image, read into PSRAM at boot.
-palm.cfg         (optional)  On-screen layout (relocate/rotate/magnify the silkscreen) plus
-                             serial-bridge settings.
+palm.cfg         (optional)  On-screen layout (relocate/rotate/magnify the silkscreen),
+                             serial-bridge settings, and optional Wi-Fi NTP time sync.
 digitizer.cfg    (optional)  Touch-sensitivity tuning. If absent, the firmware writes one
                              from the panel's current values on first boot, ready to edit.
 install/         (optional)  A directory of .prc / .pdb / .pqa files installed into RAM at
@@ -215,6 +219,29 @@ backup/          (optional)  Destination for database backups. Hold the UP side 
 
 To customize the layout, copy [`palm.cfg.example`](palm.cfg.example) to the card as `palm.cfg`
 and edit it.
+
+#### Wi-Fi NTP clock sync
+
+To sync the guest Palm OS date and time on boot, add the following keys to `palm.cfg` on the SD
+card:
+
+```ini
+wifi.ssid     = MyNetwork
+wifi.password = MyPassword
+wifi.tz       = PST8PDT,M3.2.0/2,M11.1.0/2
+wifi.ntp      = pool.ntp.org
+```
+
+- `wifi.ssid`: Required to enable sync; omit or leave blank to skip Wi-Fi at boot.
+- `wifi.password`: Omit or leave blank for open networks (for example `PICSimLabWifi` when Wi-Fi emulation is enabled in `eink-qemu`).
+- `wifi.tz`: Standard POSIX `TZ` string (defaults to `UTC0`, e.g. `CST-8`, `EST5EDT,M3.2.0/2,M11.1.0/2`).
+- `wifi.ntp`: Optional SNTP server hostname (defaults to `pool.ntp.org`).
+
+At boot, `ntp_sync_task` runs once in the background on Core 0, fetches time via SNTP, and
+immediately shuts down Wi-Fi so battery life and light sleep are unaffected. Once the OS settles
+(after `/install` and `/backup` auto-restore finish), the emulator applies the synced local time
+to Palm OS via `TimSetSeconds`, and automatically re-applies it across warm resets. The USB debug
+console also exposes `ntp status` and `ntp sync`.
 
 Requirements: Docker Desktop, and on the host Python with `esptool` and `pyserial`
 (`pip install esptool pyserial`).

@@ -22,7 +22,7 @@ the console goes dead until the physical power button).
 
 | Script | Purpose |
 |---|---|
-| `serial_console.py` | Driver for the firmware's line-protocol debug console (`--port COM5 <cmd>`, `-i` REPL, or `--capture N` for passive logging). Attaches **without** resetting the device, so it can inspect a running or sleeping board. Commands: `regs`, `irq`, `sleep`, `fb`, `tap X Y`, `penup`, `key HEX [MOD]`, `home`, `power`, `wake`. |
+| `serial_console.py` | Driver for the firmware's line-protocol debug console (`--port COM5 <cmd>`, `-i` REPL, or `--capture N` for passive logging). Attaches **without** resetting the device, so it can inspect a running or sleeping board. Commands: `regs`, `irq`, `sleep`, `fb`, `tap X Y`, `penup`, `key HEX [MOD]`, `home`, `power`, `wake`, `ntp [sync|status]`. |
 | `capture_boot.py` | Hard-resets the board (pulses RTS→EN) and streams ~N seconds of boot log to **stdout** so it can be teed to a file: `python tools/capture_boot.py COM5 18 > boot.log`. Use when the idf/miniterm monitor's un-redirectable output gets in the way. |
 
 ## Typical loop (per test build)
