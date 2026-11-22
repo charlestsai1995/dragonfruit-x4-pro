@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,6 +23,7 @@
 #include "installer.h"
 #include "backup.h"
 #include "serial_bridge.h"
+#include "wifi_ntp.h"
 
 /* CPU state lives in main.c; we only ever READ it here (racy across cores, but
  * fine for a diagnostic dump). Anything that MUTATES emulator/CPU state is
@@ -73,6 +75,7 @@ static void cmd_help(void)
     REPLY("  install [list|now|status]  PDB/PRC auto-install from /install");
     REPLY("  backup [NAME|status]       back up RAM DBs to SD /backup (NAME = one DB)");
     REPLY("  restore [NAME|status]      install DBs from SD /backup (NAME = one file)");
+    REPLY("  ntp [sync|status]          sync Wi-Fi NTP clock or inspect NTP status");
     REPLY("  reset          warm-reset the emulated Palm (databases preserved)");
 }
 
@@ -333,6 +336,32 @@ static void dispatch(char *line)
         cmd_br(BR_REQ_BACKUP, strtok(NULL, ""));   /* rest of line = optional DB name */
     } else if (strcmp(cmd, "restore") == 0) {
         cmd_br(BR_REQ_RESTORE, strtok(NULL, ""));  /* rest of line = optional /backup filename */
+    } else if (strcmp(cmd, "ntp") == 0) {
+        char *s = strtok(NULL, " \t");
+        if (s && strcmp(s, "sync") == 0) {
+            if (wifi_ntp_trigger())
+                REPLY("OK NTP sync started");
+            else if (wifi_ntp_is_active())
+                REPLY("ERR NTP sync already in progress");
+            else
+                REPLY("ERR NTP not configured (%s)", wifi_ntp_last_error());
+        } else if (!s || strcmp(s, "status") == 0) {
+            time_t now = time(NULL);
+            struct tm tm_now;
+            char tbuf[32] = "unset";
+            if (localtime_r(&now, &tm_now))
+                strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S %Z", &tm_now);
+            const char *err = wifi_ntp_last_error();
+            REPLY("OK state=%s synced=%d time='%s' palm_secs=%lu%s%s",
+                  wifi_ntp_state_str(wifi_ntp_state()),
+                  wifi_ntp_is_synced() ? 1 : 0,
+                  tbuf,
+                  (unsigned long)db_rtc_palm_seconds_now(),
+                  (err && err[0]) ? " err=" : "",
+                  (err && err[0]) ? err : "");
+        } else {
+            REPLY("ERR usage: ntp [sync|status]");
+        }
     } else if (strcmp(cmd, "reset") == 0) {
         /* Request a warm reset; the cpu task (sole CPU-state writer) services it. */
         g_warm_reset_request = true;

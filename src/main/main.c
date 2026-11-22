@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -20,6 +21,7 @@
 #include "input.h"
 #include "debug_console.h"
 #include "serial_bridge.h"
+#include "wifi_ntp.h"
 #include "rom_loader.h"
 #include "layout.h"
 #include "palm_config.h"
@@ -195,6 +197,53 @@ static void unpark_io_tasks(void)
     if (park_eg) xEventGroupClearBits(park_eg, PARK_ALL);
 }
 
+#define TRAP_TimGetSeconds  0xA0F5
+#define TRAP_TimSetSeconds  0xA0F6
+
+static bool g_ntp_apply_pending = false;
+
+static uint32_t resolve_palm_trap(uint32_t sel)
+{
+    uint32_t globals = bus_read32(0x122);
+    if (!globals || globals + (sel & 0x7FF) * 4 + 4 >= BUS_RAM_SIZE)
+        return 0;
+    uint32_t h = bus_read32(globals + (sel & 0x7FF) * 4);
+    return bus_addr_in_rom(h) ? h : 0;
+}
+
+static bool apply_ntp_time_to_palm(void)
+{
+    uint32_t h_set = resolve_palm_trap(TRAP_TimSetSeconds);
+    if (!h_set) return false;
+
+    db_rtc_resync();
+    uint32_t palm_secs = db_rtc_palm_seconds_now();
+    m68k_arg_t args[] = { { palm_secs, M68K_ARG_L } };
+    bool timed_out = false;
+    m68k_call_trap(&cpu, h_set, args, 1, NULL, &timed_out);
+    if (timed_out) {
+        ESP_LOGW(TAG, "NTP: TimSetSeconds(%lu) timed out", (unsigned long)palm_secs);
+        return false;
+    }
+
+    uint32_t readback = 0;
+    uint32_t h_get = resolve_palm_trap(TRAP_TimGetSeconds);
+    if (h_get) {
+        bool get_to = false;
+        readback = m68k_call_trap(&cpu, h_get, NULL, 0, NULL, &get_to);
+        if (get_to) readback = 0;
+    }
+
+    time_t now = time(NULL);
+    struct tm tm_now;
+    char tbuf[32] = "";
+    if (localtime_r(&now, &tm_now))
+        strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S %Z", &tm_now);
+    ESP_LOGI(TAG, "NTP: guest Palm OS clock set to %s (palm_secs=%lu, readback=%lu)",
+             tbuf, (unsigned long)palm_secs, (unsigned long)readback);
+    return true;
+}
+
 /* Warm ("soft") reset core, driven from the cpu task (the sole CPU-state writer):
  * re-init the EZ328 peripherals and re-run the 68k reset vector WITHOUT clearing RAM,
  * so storage databases survive and the ROM warm-boots. ASSUMES the display+input tasks
@@ -207,6 +256,9 @@ static void warm_reset_core(void)
     dragonball_init();
     m68k_warm_reset(&cpu);
     m68k_set_irq(&cpu, db_interrupt_pending_level());
+    memset(&g_install.pump, 0, sizeof(g_install.pump));
+    if (wifi_ntp_is_synced())
+        g_ntp_apply_pending = true;
 }
 
 /* Warm reset for callers that are NOT already parked: the `reset` console command and
@@ -387,6 +439,8 @@ static void run_br_with_confirm(bool restore)
 static void shutdown_device(bool already_parked)
 {
     ESP_LOGI(TAG, "SHUTDOWN: powering off device");
+    if (wifi_ntp_is_active())
+        wifi_ntp_cancel(3000);
     if (!already_parked)
         park_io_tasks(3000);
 
@@ -431,6 +485,9 @@ static void maybe_enter_light_sleep(void)
 {
     if (!park_eg || !db_is_asleep() || !cpu.regs.stopped)
         return;
+
+    if (wifi_ntp_is_active())
+        wifi_ntp_cancel(3000);
 
     /* Ask display + input to park at a loop boundary, then wait for both acks so
      * neither is mid SPI/I2C when we cut the clocks. */
@@ -703,6 +760,12 @@ static void cpu_task(void *param)
             }
         }
 
+        if ((g_install.phase == INST_IDLE || g_install.phase == INST_DONE) &&
+            !g_install.pump.heap_confirmed) {
+            (void)installer_os_settled(&cpu, installer_os_ready(),
+                                       db_lcd_framebuffer_addr(), false, &g_install.pump);
+        }
+
         if (g_boot_restore_pending &&
             (g_install.phase == INST_IDLE || g_install.phase == INST_DONE) &&
             installer_os_settled(&cpu, installer_os_ready(),
@@ -732,6 +795,20 @@ static void cpu_task(void *param)
         if (g_warm_reset_request) {
             do_warm_reset();
             g_warm_reset_request = false;
+        }
+
+        if (wifi_ntp_take_pending())
+            g_ntp_apply_pending = true;
+
+        if (g_ntp_apply_pending &&
+            !g_boot_restore_pending &&
+            !g_warm_reset_request &&
+            !db_is_asleep() &&
+            (g_install.phase == INST_IDLE || g_install.phase == INST_DONE) &&
+            installer_os_settled(&cpu, installer_os_ready(),
+                                 db_lcd_framebuffer_addr(), false, &g_install.pump)) {
+            if (apply_ntp_time_to_palm())
+                g_ntp_apply_pending = false;
         }
 
         /* [sleep diag] Log PLL-off sleep transitions so on-device serial reveals
@@ -1041,20 +1118,26 @@ void app_main(void)
      * through it. Then draw the static silkscreen for the active layout. */
     int serial_mode = SERIAL_MODE_AUTO;
     int serial_baud = 57600;       /* the Palm HotSync default; PC end must match */
+    wifi_ntp_config_t wifi_cfg;
+    bool wifi_enabled = false;
     {
         uint16_t pw = 960, ph = 540;
         if (display_ok) display_get_panel_size(&pw, &ph);
 
-        static char cfg_text[LAYOUT_CFG_MAX];
+        char *cfg_text = heap_caps_malloc(LAYOUT_CFG_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!cfg_text) cfg_text = malloc(LAYOUT_CFG_MAX);
         size_t cfg_len = 0;
-        config_load_result_t cr = config_load_from_sd(cfg_text, sizeof(cfg_text), &cfg_len);
+        config_load_result_t cr = cfg_text
+            ? config_load_from_sd(cfg_text, LAYOUT_CFG_MAX, &cfg_len)
+            : CONFIG_NO_FILE;
         if (cr == CONFIG_OK)
             layout_load(cfg_text, pw, ph);      /* logs applied/invalid itself */
         else
             layout_use_default(pw, ph);
 
         /* Same /palm.cfg also carries the serial-bridge settings (see
-         * serial_bridge.h): serial.mode = auto|console|passthrough, serial.baud. */
+         * serial_bridge.h): serial.mode = auto|console|passthrough, serial.baud,
+         * and optional wifi.ssid / wifi.password / wifi.tz / wifi.ntp settings. */
         if (cr == CONFIG_OK) {
             char v[24];
             if (config_get_value(cfg_text, "serial.mode", v, sizeof v)) {
@@ -1067,7 +1150,9 @@ void app_main(void)
                 if (b >= 300 && b <= 921600) serial_baud = (int)b;
                 else ESP_LOGW(TAG, "serial.baud '%s' out of range; using %d", v, serial_baud);
             }
+            wifi_enabled = wifi_ntp_parse_config(cfg_text, &wifi_cfg);
         }
+        free(cfg_text);
 
         if (display_ok) display_draw_static();
     }
@@ -1147,6 +1232,8 @@ void app_main(void)
 
     debug_console_start();   /* serial command console on UART0 */
     serial_bridge_init(serial_mode, serial_baud);  /* shares UART0; parks the console while bridging */
+    if (wifi_enabled)
+        wifi_ntp_start(&wifi_cfg);
 
     ESP_LOGI(TAG, "Emulator running");
 }

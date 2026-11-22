@@ -190,8 +190,17 @@ void m68k_jit_init(void)
     if (g_req_q && done_storage)
         g_done_q = xQueueCreateStatic(JIT_DONE_DEPTH, sizeof(compile_slot_t),
                                       done_storage, &done_qcb);
-    if (g_cc_slot && g_drain_slot && g_req_q && g_done_q &&
-        xTaskCreatePinnedToCore(jit_compiler_task, "jitcc", 8192, NULL, 2, NULL, 0) == pdPASS) {
+    BaseType_t cc_ok = pdFAIL;
+#ifdef CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+    if (g_cc_slot && g_drain_slot && g_req_q && g_done_q) {
+        cc_ok = xTaskCreatePinnedToCoreWithCaps(jit_compiler_task, "jitcc", 8192,
+                                                NULL, 2, NULL, 0, MALLOC_CAP_SPIRAM);
+    }
+#endif
+    if (cc_ok != pdPASS && g_cc_slot && g_drain_slot && g_req_q && g_done_q)
+        cc_ok = xTaskCreatePinnedToCore(jit_compiler_task, "jitcc", 8192, NULL, 2, NULL, 0);
+
+    if (g_cc_slot && g_drain_slot && g_req_q && g_done_q && cc_ok == pdPASS) {
         g_jit_async = true;
         ESP_LOGI(TAG, "async JIT compiler on core 0 (slot=%u B, req=%d done=%d)",
                  (unsigned)sizeof(compile_slot_t), JIT_REQ_DEPTH, JIT_DONE_DEPTH);

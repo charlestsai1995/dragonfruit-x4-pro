@@ -25,10 +25,10 @@ static const char *TAG = "m68kjit";
 
 #if CONFIG_IDF_TARGET_ESP32S3
 /* On ESP32-S3, SRAM1 is a unified D/IRAM pool shared by MALLOC_CAP_EXEC and
- * internal 8-bit/DMA DRAM. Keep a healthy reserve for DMA (SDMMC, SPI) and
- * FreeRTOS task stacks. */
+ * internal 8-bit/DMA DRAM. Keep a healthy reserve for DMA (SDMMC, SPI),
+ * Wi-Fi/LWIP internal state, and FreeRTOS task stacks. */
 #define JIT_CACHE_BYTES   (96 * 1024)
-#define JIT_EXEC_RESERVE  (64 * 1024)
+#define JIT_EXEC_RESERVE  (112 * 1024)
 #else
 #define JIT_CACHE_BYTES   (104 * 1024)    /* design size; shrinks if EXEC heap is tighter */
 #define JIT_EXEC_RESERVE  4096

@@ -1540,11 +1540,24 @@ backup_result_t backup_run_to_sd(m68k_cpu_t *cpu, const char *name,
     }
     mkdir(BACKUP_DIR, 0777);   /* harmless if it already exists */
 
-    /* static (not stack): the cpu task has a bounded stack and these are large. */
-    static backup_db_info_t dbs[BACKUP_MAX_DBS];
-    static char used[BACKUP_MAX_DBS][BACKUP_NAME_MAX];
+    /* PSRAM-backed tables: keep 32+ KB out of internal .bss and off the bounded
+     * cpu task stack. */
+    backup_db_info_t *dbs = bk_alloc((size_t)BACKUP_MAX_DBS * sizeof(*dbs));
+    char (*used)[BACKUP_NAME_MAX] = bk_alloc((size_t)BACKUP_MAX_DBS * BACKUP_NAME_MAX);
+    if (!dbs || !used) {
+        bk_free(dbs);
+        bk_free(used);
+        m5_sd_unmount(card);
+        ESP_LOGE(TAG, "backup: out of memory allocating DB tables");
+        return BACKUP_ERR_OUT_OF_MEMORY;
+    }
     int n = backup_enumerate(cpu, dbs, BACKUP_MAX_DBS);
-    if (n < 0) { m5_sd_unmount(card); return BACKUP_ERR_NOT_READY; }
+    if (n < 0) {
+        bk_free(dbs);
+        bk_free(used);
+        m5_sd_unmount(card);
+        return BACKUP_ERR_NOT_READY;
+    }
 
     int nused = 0;
     for (int i = 0; i < n; i++) {
@@ -1589,6 +1602,8 @@ backup_result_t backup_run_to_sd(m68k_cpu_t *cpu, const char *name,
         if (g_installer_yield) g_installer_yield();
     }
 
+    bk_free(dbs);
+    bk_free(used);
     m5_sd_unmount(card);
     ESP_LOGI(TAG, "backup complete: %d ok, %d failed, %d skipped(ROM)", *ok, *fail, *skipped);
     return BACKUP_OK;

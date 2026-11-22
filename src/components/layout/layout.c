@@ -571,13 +571,17 @@ bool layout_load(const char *cfg_text, uint16_t panel_w, uint16_t panel_h)
 {
     if (!cfg_text) { layout_use_default(panel_w, panel_h); return false; }
 
-    /* The parser tokenizes in place, so work on a mutable copy. One static
-     * buffer (not two on the stack — this runs on the limited main task stack),
-     * recopied for each of the two passes; layout_load is a one-shot boot call. */
-    static char work[LAYOUT_CFG_MAX];
+    /* The parser tokenizes in place, so work on a mutable heap copy (8 KB off
+     * internal .bss; layout_load is a one-shot boot call). */
     size_t len = strlen(cfg_text);
-    if (len >= sizeof(work)) {
+    if (len >= LAYOUT_CFG_MAX) {
         ESP_LOGE(TAG, "config too large (%u bytes); using default", (unsigned)len);
+        layout_use_default(panel_w, panel_h);
+        return false;
+    }
+    char *work = malloc(len + 1);
+    if (!work) {
+        ESP_LOGE(TAG, "out of memory parsing config; using default");
         layout_use_default(panel_w, panel_h);
         return false;
     }
@@ -614,12 +618,14 @@ bool layout_load(const char *cfg_text, uint16_t panel_w, uint16_t panel_h)
     if (!preset[0]) strcpy(preset, any_element ? "custom" : "default");
 
     if (strcmp(preset, "default") == 0) {
+        free(work);
         layout_use_default(panel_w, panel_h);
         return true;                       /* a valid, explicit default */
     }
 
     elem_place_t place[EL_COUNT];
     if (!preset_base(preset, panel_w, panel_h, place)) {
+        free(work);
         ESP_LOGE(TAG, "unknown preset '%s'; using default", preset);
         layout_use_default(panel_w, panel_h);
         return false;
@@ -684,6 +690,7 @@ bool layout_load(const char *cfg_text, uint16_t panel_w, uint16_t panel_h)
             }
         }
     }
+    free(work);
 
     if (invalid) {
         ESP_LOGE(TAG, "config has a malformed value; using default layout");

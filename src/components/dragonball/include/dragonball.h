@@ -331,6 +331,8 @@ int      db_interrupt_pending_level(void);
 uint32_t db_lcd_framebuffer_addr(void);
 
 void     db_timer_advance(uint32_t cpu_cycles);
+void     db_rtc_resync(void);
+uint32_t db_rtc_palm_seconds_now(void);
 
 /* Scanned keyboard matrix (Palm IIIx "Sumo"): Port D cols 0-3 x Port F rows
  * 0-2. Row0 = app keys; Row1 = PgUp(c0)/PgDn(c1); Row2 = Power(c0)/Contrast(c1).

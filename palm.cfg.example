@@ -91,3 +91,16 @@ preset = landscape-right
 # rotate  = 0
 # scale_x = 4
 # scale_y = 3
+
+# ---------------------------------------------------------------------------
+# Optional Wi-Fi NTP clock synchronization on boot
+#
+# When wifi.ssid is set, the emulator connects to Wi-Fi once at boot in the
+# background, syncs time via SNTP, applies it to the guest Palm OS clock
+# (after /install and /backup restore finish), then turns Wi-Fi back off.
+# wifi.tz uses standard POSIX TZ syntax (e.g. UTC0, PST8PDT,M3.2.0/2,M11.1.0/2).
+#
+# wifi.ssid     = MyNetwork
+# wifi.password = MyPassword
+# wifi.tz       = UTC0
+# wifi.ntp      = pool.ntp.org

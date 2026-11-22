@@ -55,15 +55,49 @@ static inline uint32_t rtc_seconds_to_hms(uint32_t tod)
     return (h << RTC_HMS_HOUR_SHIFT) | (m << RTC_HMS_MIN_SHIFT) | (s << RTC_HMS_SEC_SHIFT);
 }
 
+static inline struct tm *rtc_localtime(const time_t *now, struct tm *out)
+{
+#ifdef _WIN32
+    return (localtime_s(out, now) == 0) ? out : NULL;
+#else
+    return localtime_r(now, out);
+#endif
+}
+
+static uint32_t rtc_days_from_tm(const struct tm *t)
+{
+    int year = t->tm_year + 1900;
+    if (year < 1904) return 0;
+    return (uint32_t)((year - 1904) * 365 + (year - 1901) / 4 + t->tm_yday);
+}
+
 static void rtc_seed(void)
 {
     time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    rtc_tod = (uint32_t)(t->tm_hour * 3600 + t->tm_min * 60 + t->tm_sec);
-    int year = t->tm_year + 1900;
-    rtc_day = (uint32_t)((year - 1904) * 365 + (year - 1904) / 4 + t->tm_yday);
+    struct tm t;
+    if (rtc_localtime(&now, &t)) {
+        int sec = (t.tm_sec > 59) ? 59 : t.tm_sec;
+        rtc_tod = (uint32_t)(t.tm_hour * 3600 + t.tm_min * 60 + sec);
+        rtc_day = rtc_days_from_tm(&t);
+    }
     rtc_last_real = now;
+    rtc_last_alarm_sec = (int32_t)rtc_tod;
     rtc_init = 1;
+}
+
+void db_rtc_resync(void)
+{
+    rtc_seed();
+}
+
+uint32_t db_rtc_palm_seconds_now(void)
+{
+    time_t now = time(NULL);
+    struct tm t;
+    if (!rtc_localtime(&now, &t)) return 0;
+    int sec = (t.tm_sec > 59) ? 59 : t.tm_sec;
+    uint32_t tod = (uint32_t)(t.tm_hour * 3600 + t.tm_min * 60 + sec);
+    return rtc_days_from_tm(&t) * 86400u + tod;
 }
 
 void db_rtc_advance(uint32_t cpu_cycles)
@@ -79,6 +113,13 @@ void db_rtc_advance(uint32_t cpu_cycles)
     rtc_check_accum = 0;
 
     time_t now = time(NULL);
+
+    /* Re-base in O(1) if SNTP steps the wall clock backwards or ahead by >60s. */
+    if (now < rtc_last_real || (now - rtc_last_real) > 60) {
+        rtc_seed();
+        db_rtc_update_interrupt();
+        return;
+    }
 
     /* Advance one emulated second per real elapsed second.  Each RTC status
      * bit asserts only at its own true period (e.g. the 24Hr day-rollover bit
