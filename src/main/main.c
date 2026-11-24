@@ -201,6 +201,7 @@ static void unpark_io_tasks(void)
 #define TRAP_TimSetSeconds  0xA0F6
 
 static bool g_ntp_apply_pending = false;
+static TickType_t g_ntp_not_before_tick = 0;
 
 static uint32_t resolve_palm_trap(uint32_t sel)
 {
@@ -514,6 +515,10 @@ static void maybe_enter_light_sleep(void)
     gpio_wakeup_enable(PIN_BTN_POWER, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
 
+    bool     ntp_was_synced = wifi_ntp_is_synced();
+    time_t   sleep_utc      = ntp_was_synced ? time(NULL) : 0;
+    uint32_t sleep_palm     = ntp_was_synced ? db_rtc_palm_seconds_now() : 0;
+
     for (;;) {
         ESP_LOGI(TAG, "SLEEP ESP32 ENTER");
         esp_light_sleep_start();           /* whole SoC halts; resumes here on wake */
@@ -553,8 +558,17 @@ static void maybe_enter_light_sleep(void)
      * (so the silkscreen redraw doesn't race the task's own SPI), then release. */
     display_resume_after_wake();
     wake_emulated_device();
-    if (wifi_ntp_is_synced())
-        g_ntp_apply_pending = true;
+    g_ntp_not_before_tick = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
+    if (ntp_was_synced && wifi_ntp_is_synced()) {
+        time_t   wake_utc  = time(NULL);
+        uint32_t wake_palm = db_rtc_palm_seconds_now();
+        bool date_or_dst_changed =
+            (wake_palm / 86400u != sleep_palm / 86400u) ||
+            ((int64_t)wake_palm - (int64_t)sleep_palm) !=
+            ((int64_t)wake_utc - (int64_t)sleep_utc);
+        if (date_or_dst_changed)
+            g_ntp_apply_pending = true;
+    }
     unpark_io_tasks();
 }
 
@@ -806,11 +820,16 @@ static void cpu_task(void *param)
             !g_boot_restore_pending &&
             !g_warm_reset_request &&
             !db_is_asleep() &&
+            (cpu.regs.sr & SR_I_MASK) == 0 &&
+            (g_ntp_not_before_tick == 0 ||
+             (int32_t)(xTaskGetTickCount() - g_ntp_not_before_tick) >= 0) &&
             (g_install.phase == INST_IDLE || g_install.phase == INST_DONE) &&
             installer_os_settled(&cpu, installer_os_ready(),
                                  db_lcd_framebuffer_addr(), false, &g_install.pump)) {
-            if (apply_ntp_time_to_palm())
+            if (apply_ntp_time_to_palm()) {
                 g_ntp_apply_pending = false;
+                g_ntp_not_before_tick = 0;
+            }
         }
 
         /* [sleep diag] Log PLL-off sleep transitions so on-device serial reveals
